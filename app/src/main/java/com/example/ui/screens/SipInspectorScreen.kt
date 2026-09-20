@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -123,17 +124,37 @@ fun SipInspectorScreen(viewModel: McpttViewModel) {
         // ACTION BUTTONS
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
             Button(
                 onClick = { viewModel.simulateIncomingMcpttInvite() },
                 colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
                 border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityNavy),
-                modifier = Modifier.testTag("simulate_packet_button")
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("simulate_packet_button")
             ) {
                 Icon(Icons.Default.PlayArrow, contentDescription = null, tint = HighDensityNavy, modifier = Modifier.size(14.dp))
                 Spacer(modifier = Modifier.width(4.dp))
-                Text("TEST INCOMING INVITE", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold)
+                Text("TEST INVITE", fontSize = 10.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold)
+            }
+
+            Button(
+                onClick = {
+                    val shared = viewModel.shareSipTrafficLogs(context, filteredOnly = currentFilter != "ALL")
+                    if (!shared) {
+                        Toast.makeText(context, "No logs or failed to generate share file", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = HighDensityNavy),
+                modifier = Modifier
+                    .weight(1.2f)
+                    .testTag("share_sip_traffic_button")
+            ) {
+                Icon(Icons.Default.Share, contentDescription = "Share Traffic", tint = Color.White, modifier = Modifier.size(14.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("SHARE TRAFFIC (.TXT)", fontSize = 10.sp, color = Color.White, fontWeight = FontWeight.Bold)
             }
 
             IconButton(

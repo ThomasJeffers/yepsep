@@ -104,4 +104,22 @@ class SipMessageTest {
             assertTrue("Expected diff < 2000 for $sample, got $diff (decoded: $decoded)", diff < 2000)
         }
     }
+
+    @Test
+    fun testRouteSetPreservesLooseRoutingParam() {
+        val raw200 = """
+            SIP/2.0 200 OK
+            Record-Route: <sip:172.22.0.21:5060;lr>
+            Record-Route: <sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:6060;lr>
+            Contact: <sip:172.30.104.240:5070;transport=udp>
+            
+        """.trimIndent().replace("\n", "\r\n")
+
+        val msg = SipMessage.parse(raw200)
+        val routeSet = msg.extractUacRouteSet()
+        assertEquals(2, routeSet.size)
+        // Reversed: S-CSCF first, then P-CSCF
+        assertEquals("sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:6060;lr", routeSet[0])
+        assertEquals("sip:172.22.0.21:5060;lr", routeSet[1])
+    }
 }

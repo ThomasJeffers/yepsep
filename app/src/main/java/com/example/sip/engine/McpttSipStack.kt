@@ -204,7 +204,9 @@ class McpttSipStack {
 
                         // Extract dialog state
                         activeCallToTag = extractTag(msg.to)
-                        activeRemoteTargetUri = msg.extractContactUri().ifEmpty { profile.targetGroup }
+                        activeRemoteTargetUri = msg.extractContactUri().ifEmpty {
+                            profile.asFallbackUri.ifEmpty { profile.targetGroup }
+                        }
                         activeRouteSet = msg.extractUacRouteSet()
 
                         // Extract SDP media information
@@ -420,10 +422,17 @@ class McpttSipStack {
             append("a=sendrecv\r\n")
         }
 
+        val routeHeader = if (profile.scscfOrigRoute.isNotBlank()) {
+            "Route: <${profile.scscfOrigRoute.trim()}>\r\n"
+        } else ""
+
         val sipPacket = buildString {
             append("INVITE $targetUri SIP/2.0\r\n")
             append("Via: SIP/2.0/UDP $localIp:${profile.localSipPort};branch=$branch;rport\r\n")
             append("Max-Forwards: 70\r\n")
+            if (routeHeader.isNotEmpty()) {
+                append(routeHeader)
+            }
             append("From: <${profile.mcpttId}>;tag=$activeCallFromTag\r\n")
             append("To: <$targetUri>\r\n")
             append("Call-ID: $activeCallId\r\n")

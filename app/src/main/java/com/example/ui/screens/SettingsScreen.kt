@@ -75,6 +75,8 @@ fun SettingsScreen(viewModel: McpttViewModel) {
     var localSipPort by remember(currentProfile) { mutableStateOf(currentProfile.localSipPort.toString()) }
     var localRtpPort by remember(currentProfile) { mutableStateOf(currentProfile.localRtpPort.toString()) }
     var targetGroup by remember(currentProfile) { mutableStateOf(currentProfile.targetGroup) }
+    var scscfOrigRoute by remember(currentProfile) { mutableStateOf(currentProfile.scscfOrigRoute) }
+    var asFallbackUri by remember(currentProfile) { mutableStateOf(currentProfile.asFallbackUri) }
 
     var autoRegister by remember(currentProfile) { mutableStateOf(currentProfile.autoRegister) }
     var includeMcpttTags by remember(currentProfile) { mutableStateOf(currentProfile.includeMcpttTags) }
@@ -164,6 +166,8 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     localSipPort = "5062"
                     localRtpPort = "6000"
                     targetGroup = "sip:group1@ims.mnc070.mcc901.3gppnetwork.org"
+                    scscfOrigRoute = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:5060;lr"
+                    asFallbackUri = "sip:172.30.104.240:5070;transport=udp"
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
                 border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
@@ -184,6 +188,8 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     localSipPort = "5064"
                     localRtpPort = "6004"
                     targetGroup = "sip:group1@ims.mnc070.mcc901.3gppnetwork.org"
+                    scscfOrigRoute = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:5060;lr"
+                    asFallbackUri = "sip:172.30.104.240:5070;transport=udp"
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
                 border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
@@ -265,6 +271,10 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         }
         Spacer(modifier = Modifier.height(8.dp))
         OutlinedField("Target Talkgroup URI", targetGroup) { targetGroup = it }
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedField("S-CSCF Orig-Route URI (exp5_uac)", scscfOrigRoute) { scscfOrigRoute = it }
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedField("MCPTT AS Fallback URI (exp5_uac)", asFallbackUri) { asFallbackUri = it }
 
         Spacer(modifier = Modifier.height(14.dp))
 
@@ -349,6 +359,8 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     localSipPort = localSipPort.toIntOrNull() ?: 5062,
                     localRtpPort = localRtpPort.toIntOrNull() ?: 6000,
                     targetGroup = targetGroup.trim(),
+                    scscfOrigRoute = scscfOrigRoute.trim(),
+                    asFallbackUri = asFallbackUri.trim(),
                     autoRegister = autoRegister,
                     includeMcpttTags = includeMcpttTags,
                     autoGrantFloor = autoGrantFloor

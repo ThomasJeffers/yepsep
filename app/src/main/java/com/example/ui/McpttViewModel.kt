@@ -1,6 +1,9 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.McpttRepository
@@ -20,6 +23,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class McpttViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = McpttRepository(application)
@@ -143,6 +150,82 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearTrafficLogs() {
         repository.clearLogs()
+    }
+
+    /**
+     * Formats all currently logged or filtered SIP traffic into a standardized text dump for analysis,
+     * comparing directly against exp5_uac.py packet traces.
+     */
+    fun buildTrafficLogExportText(filteredOnly: Boolean = false): String {
+        val logsToExport = if (filteredOnly) filteredLogs.value else allLogs.value
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+        val profile = sipProfile.value
+
+        return buildString {
+            append("================================================================================\n")
+            append("MCPTT CLIENT - SIP & MEDIA TRAFFIC INSPECTOR LOG EXPORT\n")
+            append("Generated: ${dateFormat.format(Date())}\n")
+            append("Subscriber IMSI: ${profile.imsi} | IMPU: ${profile.mcpttId}\n")
+            append("P-CSCF: ${profile.pcscfHost}:${profile.pcscfPort} | Local SIP Port: ${profile.localSipPort}\n")
+            append("Local APN IPv4: ${sipStack.apnManager?.boundIp ?: "Unbound"}\n")
+            append("Total Packets Exported: ${logsToExport.size}\n")
+            append("================================================================================\n\n")
+
+            if (logsToExport.isEmpty()) {
+                append("No SIP traffic records captured.\n")
+            } else {
+                // Export in chronological order (oldest to newest) for easy flow sequence analysis
+                logsToExport.reversed().forEachIndexed { index, log ->
+                    val dirStr = if (log.direction == LogDirection.OUTBOUND) "TX >>>>>>>>" else "<<<<<<<< RX"
+                    append("--------------------------------------------------------------------------------\n")
+                    append("#${index + 1} | [${dateFormat.format(Date(log.timestamp))}] $dirStr ${log.remoteAddress}\n")
+                    append("SUMMARY: ${log.summary}\n")
+                    append("TYPE: ${log.type} | MCPTT_TAGGED: ${log.isMcpttTagged} | ERROR: ${log.hasError}\n")
+                    append("--------------------------------------------------------------------------------\n")
+                    append(log.rawPacket.trimEnd())
+                    append("\n\n")
+                }
+            }
+            append("================================================================================\n")
+            append("END OF LOG EXPORT\n")
+            append("================================================================================\n")
+        }
+    }
+
+    /**
+     * Writes the SIP traffic log to a temporary .txt file in the app's cache directory
+     * and triggers the system share sheet via Intent.ACTION_SEND with FileProvider.
+     */
+    fun shareSipTrafficLogs(context: Context, filteredOnly: Boolean = false): Boolean {
+        return try {
+            val exportText = buildTrafficLogExportText(filteredOnly)
+            val cacheDir = File(context.cacheDir, "sip_exports")
+            if (!cacheDir.exists()) {
+                cacheDir.mkdirs()
+            }
+            val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val file = File(cacheDir, "mcptt_sip_traffic_$timeStamp.txt")
+            file.writeText(exportText, Charsets.UTF_8)
+
+            val authority = "${context.packageName}.fileprovider"
+            val fileUri = FileProvider.getUriForFile(context, authority, file)
+
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, fileUri)
+                putExtra(Intent.EXTRA_SUBJECT, "MCPTT SIP Traffic Log ($timeStamp)")
+                putExtra(Intent.EXTRA_TEXT, "Attached is the MCPTT SIP trace log from $timeStamp (${if (filteredOnly) "Filtered" else "All"} packets).")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            val chooser = Intent.createChooser(shareIntent, "Share SIP Traffic Log (.txt)")
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(chooser)
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("McpttViewModel", "Failed to share SIP traffic logs: ${e.message}", e)
+            false
+        }
     }
 
     fun simulateIncomingMcpttInvite() {

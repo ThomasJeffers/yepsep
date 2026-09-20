@@ -53,6 +53,7 @@ data class SipMessage(
 
     /**
      * Extracts Record-Route URIs in reverse order (P-CSCF first), as required by RFC 3261 UAC route sets.
+     * Preserves parameters such as ;lr needed for SIP proxy loose routing.
      */
     fun extractUacRouteSet(): List<String> {
         val rr = getHeaders("record-route")
@@ -66,7 +67,7 @@ data class SipMessage(
                     val uri = if (trimmed.contains("<") && trimmed.contains(">")) {
                         trimmed.substringAfter("<").substringBefore(">")
                     } else {
-                        trimmed.substringBefore(";")
+                        trimmed
                     }
                     parsed.add(uri)
                 }
