@@ -26,10 +26,15 @@ import java.security.MessageDigest
 import java.util.UUID
 
 enum class RegistrationState {
+    NETWORK_UNAVAILABLE,
+    MCPTT_APN_BOUND,
     UNREGISTERED,
     REGISTERING,
+    AUTHENTICATING,
     REGISTERED,
-    FAILED
+    REGISTRATION_FAILED;
+
+    val isRegistered: Boolean get() = this == REGISTERED
 }
 
 enum class CallSessionState {
@@ -55,6 +60,9 @@ class McpttSipStack {
     private val _registrationState = MutableStateFlow(RegistrationState.UNREGISTERED)
     val registrationState: StateFlow<RegistrationState> = _registrationState.asStateFlow()
 
+    private val _registrationFailureReason = MutableStateFlow<String?>(null)
+    val registrationFailureReason: StateFlow<String?> = _registrationFailureReason.asStateFlow()
+
     private val _callState = MutableStateFlow(CallSessionState.IDLE)
     val callState: StateFlow<CallSessionState> = _callState.asStateFlow()
 
@@ -77,6 +85,7 @@ class McpttSipStack {
     private var registerCallId = UUID.randomUUID().toString()
     private var registerFromTag = generateTag()
     private var registerCSeq = 1
+    private var registerAuthAttempts = 0
     private var lastAuthNonce = ""
     private var lastAuthRealm = ""
     private var lastAuthQop = ""
@@ -107,6 +116,27 @@ class McpttSipStack {
         netMgr.startMonitoring()
 
         initSocket()
+
+        // Observe cellular APN network status to update socket binding and state
+        scope.launch {
+            netMgr.networkStatus.collect { netStatus ->
+                when (netStatus) {
+                    is ApnNetworkStatus.Bound -> {
+                        sipSocket?.let { netMgr.bindSocket(it) }
+                        if (_registrationState.value == RegistrationState.UNREGISTERED ||
+                            _registrationState.value == RegistrationState.NETWORK_UNAVAILABLE) {
+                            _registrationState.value = RegistrationState.MCPTT_APN_BOUND
+                        }
+                    }
+                    is ApnNetworkStatus.Disconnected -> {
+                        if (_registrationState.value != RegistrationState.REGISTERED) {
+                            _registrationState.value = RegistrationState.NETWORK_UNAVAILABLE
+                        }
+                    }
+                    else -> {}
+                }
+            }
+        }
 
         if (initialProfile.autoRegister) {
             scope.launch {
@@ -181,16 +211,19 @@ class McpttSipStack {
                 when (msg.statusCode) {
                     200 -> {
                         _registrationState.value = RegistrationState.REGISTERED
-                        Log.i(TAG, "SIP REGISTER 200 OK - Registered to S-CSCF")
+                        _registrationFailureReason.value = null
+                        registerAuthAttempts = 0
+                        Log.i(TAG, "200 OK RX: SIP REGISTER 200 OK received for Call-ID=${msg.callId}")
+                        Log.i(TAG, "REGISTERED: Successfully registered to S-CSCF / IMS core")
                     }
                     401 -> {
-                        _registrationState.value = RegistrationState.REGISTERING
-                        Log.i(TAG, "SIP REGISTER 401 Unauthorized - Challenging with MD5 digest")
                         handleRegister401(msg)
                     }
                     else -> {
                         if (msg.statusCode >= 400) {
-                            _registrationState.value = RegistrationState.FAILED
+                            _registrationState.value = RegistrationState.REGISTRATION_FAILED
+                            _registrationFailureReason.value = "SIP ${msg.statusCode} ${msg.statusText}"
+                            registerAuthAttempts = 0
                             Log.e(TAG, "SIP REGISTER failed with status ${msg.statusCode} ${msg.statusText}")
                         }
                     }
@@ -314,31 +347,47 @@ class McpttSipStack {
     }
 
     fun register() {
+        registerAuthAttempts = 0
+        _registrationFailureReason.value = null
         _registrationState.value = RegistrationState.REGISTERING
-        registerCallId = UUID.randomUUID().toString() + "@" + profile.realm
-        registerFromTag = generateTag()
+        registerCallId = "reg-" + UUID.randomUUID().toString().replace("-", "").take(12) + "@" + profile.realm
+        registerFromTag = "reg-" + UUID.randomUUID().toString().replace("-", "").take(8)
         registerCSeq = 1
 
+        Log.i(TAG, "REGISTER TX: Sending unauthenticated REGISTER (CSeq: $registerCSeq, Call-ID: $registerCallId) to ${profile.pcscfHost}:${profile.pcscfPort}")
+        sendRegisterPacket(registerCSeq, authHeader = null)
+    }
+
+    private fun sendRegisterPacket(cseq: Int, authHeader: String?) {
         val localIp = getLocalIpAddress()
-        val branch = "z9hG4bK-" + UUID.randomUUID().toString().take(12)
+        val branch = "z9hG4bK-" + UUID.randomUUID().toString().replace("-", "").take(12)
+        val uri = "sip:${profile.realm}"
 
         val mcpttContactParam = if (profile.includeMcpttTags) ";+g.3gpp.mcptt" else ""
         val acceptContact = if (profile.includeMcpttTags) {
             "Accept-Contact: *;+g.3gpp.mcptt;explicit;require\r\n"
         } else ""
 
+        val authLine = if (!authHeader.isNullOrBlank()) {
+            "Authorization: $authHeader\r\n"
+        } else ""
+
         val sipPacket = buildString {
-            append("REGISTER sip:${profile.realm} SIP/2.0\r\n")
+            append("REGISTER $uri SIP/2.0\r\n")
             append("Via: SIP/2.0/UDP $localIp:${profile.localSipPort};branch=$branch;rport\r\n")
             append("Max-Forwards: 70\r\n")
+            // RFC 3261: Retain exact same From tag and Call-ID on 401 challenge re-attempt
             append("From: <${profile.mcpttId}>;tag=$registerFromTag\r\n")
             append("To: <${profile.mcpttId}>\r\n")
             append("Call-ID: $registerCallId\r\n")
-            append("CSeq: $registerCSeq REGISTER\r\n")
+            append("CSeq: $cseq REGISTER\r\n")
             append("Contact: <sip:${profile.imsi}@$localIp:${profile.localSipPort}>$mcpttContactParam\r\n")
             append("Expires: 3600\r\n")
             append("User-Agent: ${profile.userAgent}\r\n")
             append(acceptContact)
+            if (authLine.isNotEmpty()) {
+                append(authLine)
+            }
             append("Content-Length: 0\r\n\r\n")
         }
 
@@ -346,56 +395,64 @@ class McpttSipStack {
     }
 
     private fun handleRegister401(msg: SipMessage) {
+        Log.i(TAG, "401 RX: Received 401 Unauthorized challenge for Call-ID=$registerCallId")
+
+        // Guard against repeated 401 infinite loop
+        if (registerAuthAttempts >= 1) {
+            Log.e(TAG, "Registration failed: Repeated 401 challenge received after sending credentials. Stopping retry loop to prevent packet flood.")
+            _registrationState.value = RegistrationState.REGISTRATION_FAILED
+            _registrationFailureReason.value = "Authentication failed: 401 Unauthorized (credentials rejected)"
+            return
+        }
+        registerAuthAttempts++
+
         val authHeader = msg.getHeader("www-authenticate").ifEmpty { msg.getHeader("proxy-authenticate") }
-        val realm = extractAuthParam(authHeader, "realm").ifEmpty { profile.realm }
-        val nonce = extractAuthParam(authHeader, "nonce")
-        val qop = extractAuthParam(authHeader, "qop")
-        val opaque = extractAuthParam(authHeader, "opaque")
+        if (authHeader.isBlank()) {
+            Log.e(TAG, "Registration failed: 401 response missing WWW-Authenticate header")
+            _registrationState.value = RegistrationState.REGISTRATION_FAILED
+            _registrationFailureReason.value = "401 missing WWW-Authenticate"
+            return
+        }
 
-        lastAuthRealm = realm
-        lastAuthNonce = nonce
-        lastAuthQop = qop
-        lastAuthOpaque = opaque
+        val realm = SipAuthHelper.extractAuthParam(authHeader, "realm").ifEmpty { profile.realm }
+        val nonce = SipAuthHelper.extractAuthParam(authHeader, "nonce")
+        val rawQop = SipAuthHelper.extractAuthParam(authHeader, "qop")
+        val qop = SipAuthHelper.selectQop(rawQop).ifEmpty { "auth" }
+        val opaque = SipAuthHelper.extractAuthParam(authHeader, "opaque")
 
+        if (nonce.isEmpty()) {
+            Log.e(TAG, "Registration failed: 401 challenge missing nonce")
+            _registrationState.value = RegistrationState.REGISTRATION_FAILED
+            _registrationFailureReason.value = "401 challenge missing nonce"
+            return
+        }
+
+        // Diagnostic logging: NEVER log plaintext subscriber password
+        Log.i(TAG, "Digest challenge parsed: realm='$realm', nonce='${nonce.take(8)}... (len=${nonce.length})', qop='$qop', algorithm=MD5")
+
+        // Display AUTHENTICATING (401 MD5) in UI
+        _registrationState.value = RegistrationState.AUTHENTICATING
+
+        // RFC 3261: Increment CSeq for the authenticated REGISTER
         registerCSeq++
-        val localIp = getLocalIpAddress()
-        val branch = "z9hG4bK-" + UUID.randomUUID().toString().take(12)
-        val uri = "sip:${profile.realm}"
-        val authUsername = "${profile.imsi}@${profile.realm}"
 
-        val authDigest = computeDigestResponse(
+        val uri = "sip:${profile.realm}"
+        val authUsername = if (profile.imsi.contains("@")) profile.imsi else "${profile.imsi}@$realm"
+
+        val authHeaderValue = SipAuthHelper.buildAuthorizationHeader(
             username = authUsername,
             realm = realm,
             password = profile.password,
             method = "REGISTER",
             uri = uri,
             nonce = nonce,
-            qop = qop
+            rawQop = qop,
+            opaque = opaque,
+            nc = "00000001"
         )
 
-        val mcpttContactParam = if (profile.includeMcpttTags) ";+g.3gpp.mcptt" else ""
-        val acceptContact = if (profile.includeMcpttTags) {
-            "Accept-Contact: *;+g.3gpp.mcptt;explicit;require\r\n"
-        } else ""
-
-        val sipPacket = buildString {
-            append("REGISTER sip:${profile.realm} SIP/2.0\r\n")
-            append("Via: SIP/2.0/UDP $localIp:${profile.localSipPort};branch=$branch;rport\r\n")
-            append("Max-Forwards: 70\r\n")
-            // RFC 3261: Must retain the exact same From tag and Call-ID on 401 re-attempt
-            append("From: <${profile.mcpttId}>;tag=$registerFromTag\r\n")
-            append("To: <${profile.mcpttId}>\r\n")
-            append("Call-ID: $registerCallId\r\n")
-            append("CSeq: $registerCSeq REGISTER\r\n")
-            append("Contact: <sip:${profile.imsi}@$localIp:${profile.localSipPort}>$mcpttContactParam\r\n")
-            append("Expires: 3600\r\n")
-            append("User-Agent: ${profile.userAgent}\r\n")
-            append(acceptContact)
-            append("Authorization: $authDigest\r\n")
-            append("Content-Length: 0\r\n\r\n")
-        }
-
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        Log.i(TAG, "Authenticated REGISTER TX: Sending authenticated REGISTER (CSeq: $registerCSeq, username: $authUsername, realm: $realm)")
+        sendRegisterPacket(registerCSeq, authHeader = authHeaderValue)
     }
 
     fun initiateMcpttCall(targetUri: String = profile.targetGroup) {
@@ -777,52 +834,8 @@ class McpttSipStack {
         return null
     }
 
-    private fun extractAuthParam(authHeader: String, paramName: String): String {
-        val pattern = Regex("""$paramName=["']?([^"',]+)["']?""", RegexOption.IGNORE_CASE)
-        val match = pattern.find(authHeader)
-        return match?.groupValues?.get(1) ?: ""
-    }
-
-    private fun computeDigestResponse(
-        username: String,
-        realm: String,
-        password: String,
-        method: String,
-        uri: String,
-        nonce: String,
-        qop: String
-    ): String {
-        val ha1 = md5Hex("$username:$realm:$password")
-        val ha2 = md5Hex("$method:$uri")
-        val cnonce = UUID.randomUUID().toString().take(8)
-        val nc = "00000001"
-
-        val response = if (qop.isNotEmpty()) {
-            md5Hex("$ha1:$nonce:$nc:$cnonce:auth:$ha2")
-        } else {
-            md5Hex("$ha1:$nonce:$ha2")
-        }
-
-        return buildString {
-            append("Digest username=\"$username\", ")
-            append("realm=\"$realm\", ")
-            append("nonce=\"$nonce\", ")
-            append("uri=\"$uri\", ")
-            append("response=\"$response\", ")
-            append("algorithm=MD5")
-            if (qop.isNotEmpty()) {
-                append(", qop=auth, nc=$nc, cnonce=\"$cnonce\"")
-            }
-            if (lastAuthOpaque.isNotEmpty()) {
-                append(", opaque=\"$lastAuthOpaque\"")
-            }
-        }
-    }
-
     private fun md5Hex(input: String): String {
-        val md = MessageDigest.getInstance("MD5")
-        val bytes = md.digest(input.toByteArray(Charsets.UTF_8))
-        return bytes.joinToString("") { "%02x".format(it) }
+        return SipAuthHelper.md5Hex(input)
     }
 
     companion object {

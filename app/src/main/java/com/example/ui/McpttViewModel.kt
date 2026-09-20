@@ -35,6 +35,7 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
 
     val sipProfile: StateFlow<SipProfile> = repository.sipProfile
     val registrationState: StateFlow<RegistrationState> = sipStack.registrationState
+    val registrationFailureReason: StateFlow<String?> = sipStack.registrationFailureReason
     val callState: StateFlow<CallSessionState> = sipStack.callState
     val floorState: StateFlow<FloorState> = sipStack.floorState
     val activeSpeaker: StateFlow<String?> = sipStack.activeSpeaker

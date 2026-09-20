@@ -138,32 +138,69 @@ data class SipMessage(
 
             val singleHeaders = mutableMapOf<String, String>()
             val multiHeaders = mutableMapOf<String, MutableList<String>>()
-            var bodyStartIndex = -1
 
-            for (i in 1 until lines.size) {
-                val line = lines[i]
-                if (line.isEmpty() || line == "\r") {
-                    bodyStartIndex = i + 1
-                    break
-                }
-                val colonIndex = line.indexOf(':')
-                if (colonIndex > 0) {
-                    val headerName = line.substring(0, colonIndex).trim().lowercase()
-                    val headerValue = line.substring(colonIndex + 1).trim()
-                    if (!singleHeaders.containsKey(headerName)) {
-                        singleHeaders[headerName] = headerValue
+            // Locate header / body separator (CRLF CRLF or LF LF)
+            val blankLineIndex = rawText.indexOf("\r\n\r\n").takeIf { it != -1 }
+                ?: rawText.indexOf("\n\n").takeIf { it != -1 }
+
+            val headerText = if (blankLineIndex != null) rawText.substring(0, blankLineIndex) else rawText
+            val body = if (blankLineIndex != null) rawText.substring(blankLineIndex).trimStart('\r', '\n') else ""
+
+            val rawHeaderLines = headerText.lines().map { it.trimEnd('\r') }
+            val unfoldedHeaderLines = mutableListOf<String>()
+
+            // RFC 3261 Section 7.3.1: Line unfolding
+            for (i in 1 until rawHeaderLines.size) {
+                val line = rawHeaderLines[i]
+                if (line.isEmpty()) continue
+                if (line.startsWith(" ") || line.startsWith("\t")) {
+                    if (unfoldedHeaderLines.isNotEmpty()) {
+                        val lastIdx = unfoldedHeaderLines.size - 1
+                        unfoldedHeaderLines[lastIdx] = unfoldedHeaderLines[lastIdx] + " " + line.trim()
                     }
-                    multiHeaders.getOrPut(headerName) { mutableListOf() }.add(headerValue)
+                } else if (!line.contains(":") && unfoldedHeaderLines.isNotEmpty()) {
+                    // Proxies/servers wrapping authentication headers without leading whitespace
+                    val lastIdx = unfoldedHeaderLines.size - 1
+                    unfoldedHeaderLines[lastIdx] = unfoldedHeaderLines[lastIdx] + " " + line.trim()
+                } else {
+                    unfoldedHeaderLines.add(line.trim())
                 }
             }
 
-            val body = if (bodyStartIndex in 1..lines.size) {
-                lines.subList(bodyStartIndex, lines.size).joinToString("\n")
-            } else ""
+            for (hLine in unfoldedHeaderLines) {
+                val colonIndex = hLine.indexOf(':')
+                if (colonIndex > 0) {
+                    val rawHeaderName = hLine.substring(0, colonIndex).trim().lowercase()
+                    val headerValue = hLine.substring(colonIndex + 1).trim()
+
+                    // Canonicalize compact SIP headers
+                    val headerName = when (rawHeaderName) {
+                        "v" -> "via"
+                        "f" -> "from"
+                        "t" -> "to"
+                        "m" -> "contact"
+                        "i" -> "call-id"
+                        "c" -> "content-type"
+                        "l" -> "content-length"
+                        else -> rawHeaderName
+                    }
+
+                    if (!singleHeaders.containsKey(headerName)) {
+                        singleHeaders[headerName] = headerValue
+                    }
+                    if (rawHeaderName != headerName && !singleHeaders.containsKey(rawHeaderName)) {
+                        singleHeaders[rawHeaderName] = headerValue
+                    }
+                    multiHeaders.getOrPut(headerName) { mutableListOf() }.add(headerValue)
+                    if (rawHeaderName != headerName) {
+                        multiHeaders.getOrPut(rawHeaderName) { mutableListOf() }.add(headerValue)
+                    }
+                }
+            }
 
             val cseqVal = singleHeaders["cseq"] ?: ""
             if (isResponse && method.isEmpty() && cseqVal.isNotEmpty()) {
-                val cseqParts = cseqVal.split(" ")
+                val cseqParts = cseqVal.trim().split(Regex("""\s+"""))
                 if (cseqParts.size >= 2) {
                     method = cseqParts[1].uppercase()
                 }

@@ -93,6 +93,7 @@ import com.example.ui.theme.HighDensityWarning
 fun TacticalPttScreen(viewModel: McpttViewModel) {
     val context = LocalContext.current
     val registrationState by viewModel.registrationState.collectAsState()
+    val failureReason by viewModel.registrationFailureReason.collectAsState()
     val callState by viewModel.callState.collectAsState()
     val floorState by viewModel.floorState.collectAsState()
     val activeSpeaker by viewModel.activeSpeaker.collectAsState()
@@ -273,14 +274,22 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                     Icon(
                         imageVector = when (registrationState) {
                             RegistrationState.REGISTERED -> Icons.Default.CheckCircle
+                            RegistrationState.AUTHENTICATING -> Icons.Default.WarningAmber
                             RegistrationState.REGISTERING -> Icons.Default.WarningAmber
-                            else -> Icons.Default.Warning
+                            RegistrationState.MCPTT_APN_BOUND -> Icons.Default.CellTower
+                            RegistrationState.REGISTRATION_FAILED -> Icons.Default.Warning
+                            RegistrationState.NETWORK_UNAVAILABLE -> Icons.Default.Warning
+                            RegistrationState.UNREGISTERED -> Icons.Default.Warning
                         },
                         contentDescription = "IMS Status",
                         tint = when (registrationState) {
                             RegistrationState.REGISTERED -> Color(0xFF4ADE80)
+                            RegistrationState.AUTHENTICATING -> HighDensityWarning
                             RegistrationState.REGISTERING -> HighDensityWarning
-                            else -> HighDensityEmergency
+                            RegistrationState.MCPTT_APN_BOUND -> Color(0xFF60A5FA)
+                            RegistrationState.REGISTRATION_FAILED -> HighDensityEmergency
+                            RegistrationState.NETWORK_UNAVAILABLE -> Color(0xFFEF4444)
+                            RegistrationState.UNREGISTERED -> Color.Gray
                         },
                         modifier = Modifier.size(22.dp)
                     )
@@ -295,25 +304,47 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                         )
                         Text(
                             text = when (registrationState) {
-                                RegistrationState.REGISTERED -> "REGISTERED (200 OK)"
-                                RegistrationState.REGISTERING -> "AUTHENTICATING (401 MD5)..."
-                                RegistrationState.FAILED -> "REGISTRATION FAILED"
-                                else -> "UNREGISTERED"
+                                RegistrationState.REGISTERED -> "REGISTERED"
+                                RegistrationState.AUTHENTICATING -> "AUTHENTICATING (401 MD5)"
+                                RegistrationState.REGISTERING -> "REGISTERING..."
+                                RegistrationState.MCPTT_APN_BOUND -> "MCPTT APN BOUND"
+                                RegistrationState.NETWORK_UNAVAILABLE -> "NETWORK UNAVAILABLE"
+                                RegistrationState.REGISTRATION_FAILED -> "REGISTRATION FAILED"
+                                RegistrationState.UNREGISTERED -> "UNREGISTERED"
                             },
                             fontSize = 13.sp,
                             color = Color.White,
                             fontWeight = FontWeight.Bold
                         )
+                        if (registrationState == RegistrationState.REGISTRATION_FAILED && !failureReason.isNullOrBlank()) {
+                            Text(
+                                text = failureReason ?: "",
+                                fontSize = 10.sp,
+                                color = HighDensityEmergency,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
 
                 if (registrationState != RegistrationState.REGISTERED) {
+                    val isAuthenticating = registrationState == RegistrationState.AUTHENTICATING || registrationState == RegistrationState.REGISTERING
                     Button(
                         onClick = { viewModel.registerSip() },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                        enabled = !isAuthenticating,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color.White,
+                            disabledContainerColor = Color.White.copy(alpha = 0.5f)
+                        ),
                         modifier = Modifier.testTag("register_button")
                     ) {
-                        Text("REGISTER", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold)
+                        Text(
+                            if (isAuthenticating) "WAIT..." else "REGISTER",
+                            fontSize = 11.sp,
+                            color = HighDensityNavy,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }
