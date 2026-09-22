@@ -110,26 +110,51 @@ class McpttSipStack {
     var onFloorGranted: (() -> Unit)? = null
     var onPacketSent: ((rawSip: String, destHost: String, destPort: Int) -> Unit)? = null
 
+    val currentSocket: DatagramSocket?
+        get() = sipSocket
+
     fun start(context: Context, initialProfile: SipProfile) {
         this.profile = initialProfile
         val netMgr = McpttApnNetworkManager(context.applicationContext, scope)
         this.apnManager = netMgr
         netMgr.updateConfig(initialProfile.apnName, initialProfile.apnPrefix)
-        netMgr.startMonitoring()
 
+        // Initialize ONE stable DatagramSocket for the lifetime of this stack
         initSocket()
 
-        // Observe cellular APN network status to update socket binding and state
+        // Handle genuine network transitions without destroying the transport unless rebinding fails
+        netMgr.onNetworkChanged = { newNet ->
+            val socket = sipSocket
+            if (socket != null && !socket.isClosed && newNet != null) {
+                val sockId = System.identityHashCode(socket).toString(16)
+                try {
+                    newNet.bindSocket(socket)
+                    Log.i(TAG, "SIP SOCKET NETWORK BIND id=$sockId network=$newNet")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not rebind socket id=$sockId to changed network $newNet (${e.message}), recreating socket")
+                    recreateSocket()
+                }
+            }
+        }
+
+        netMgr.startMonitoring()
+
+        // Observe cellular APN network status to update socket binding and state without recreating transport
         scope.launch {
             netMgr.networkStatus.collect { netStatus ->
                 when (netStatus) {
                     is ApnNetworkStatus.Bound -> {
-                        val currentLocalAddr = sipSocket?.localAddress?.hostAddress
-                        if (currentLocalAddr != netStatus.ip) {
-                            Log.i(TAG, "APN network bound to ${netStatus.ip}. Updating SIP socket binding to match ${netStatus.ip}:${profile.localSipPort}")
-                            initSocket(netStatus.ip)
-                        } else {
-                            sipSocket?.let { netMgr.bindSocket(it) }
+                        val socket = sipSocket
+                        if (socket != null && !socket.isClosed) {
+                            val sockId = System.identityHashCode(socket).toString(16)
+                            netMgr.activeNetwork?.let { net ->
+                                try {
+                                    net.bindSocket(socket)
+                                    Log.i(TAG, "SIP SOCKET NETWORK BIND id=$sockId network=$net")
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Could not bind existing socket id=$sockId to network $net: ${e.message}")
+                                }
+                            }
                         }
                         if (_registrationState.value == RegistrationState.UNREGISTERED ||
                             _registrationState.value == RegistrationState.NETWORK_UNAVAILABLE) {
@@ -164,75 +189,86 @@ class McpttSipStack {
         }
 
         if (portChanged) {
-            initSocket()
+            Log.i(TAG, "SIP local port changed to ${newProfile.localSipPort}, recreating socket")
+            recreateSocket()
         }
     }
 
-    private fun initSocket(targetIp: String? = null) {
+    fun stop() {
+        listenJob?.cancel()
+        try {
+            sipSocket?.close()
+        } catch (_: Exception) {}
+        sipSocket = null
+        apnManager?.stopMonitoring()
+    }
+
+    @Synchronized
+    fun recreateSocket(): DatagramSocket {
+        listenJob?.cancel()
+        try {
+            sipSocket?.close()
+        } catch (_: Exception) {}
+        sipSocket = null
+        return initSocket()
+    }
+
+    @Synchronized
+    fun initSocket(): DatagramSocket {
+        val existing = sipSocket
+        if (existing != null && !existing.isClosed && existing.localPort == profile.localSipPort) {
+            val sockId = System.identityHashCode(existing).toString(16)
+            apnManager?.activeNetwork?.let { net ->
+                try {
+                    net.bindSocket(existing)
+                    Log.i(TAG, "SIP SOCKET NETWORK BIND id=$sockId network=$net")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not bind existing socket id=$sockId to network $net: ${e.message}")
+                }
+            }
+            return existing
+        }
+
         try {
             listenJob?.cancel()
-            sipSocket?.close()
+            existing?.close()
         } catch (e: Exception) {
             Log.w(TAG, "Error closing previous socket: ${e.message}")
         }
 
-        try {
-            val socket = DatagramSocket(null).apply {
-                reuseAddress = true
-                broadcast = false
-            }
-
-            // Pre-bind socket to cellular network interface if active
-            apnManager?.bindSocket(socket)
-
-            val localIp = targetIp ?: getLocalIpAddress()
-            val bindAddr = try {
-                if (localIp.isNotBlank() && localIp != "0.0.0.0") {
-                    InetAddress.getByName(localIp)
-                } else null
-            } catch (e: Exception) {
-                null
-            }
-
-            var boundDirectly = false
-            if (bindAddr != null) {
-                try {
-                    val socketAddress = InetSocketAddress(bindAddr, profile.localSipPort)
-                    socket.bind(socketAddress)
-                    boundDirectly = true
-                    Log.i(TAG, "SIP Stack bound directly to local IP: $localIp:${profile.localSipPort}")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Could not bind directly to $localIp:${profile.localSipPort} (${e.message}), binding to wildcard port")
-                }
-            }
-
-            if (!boundDirectly) {
-                socket.bind(InetSocketAddress(profile.localSipPort))
-                Log.i(TAG, "SIP Stack bound to wildcard UDP port ${profile.localSipPort}")
-            }
-
-            // Bind to cellular network interface
-            apnManager?.bindSocket(socket)
-            sipSocket = socket
-
-            Log.i(TAG, "SIP Stack ready on ${socket.localAddress?.hostAddress}:${socket.localPort} (MCPTT net bound: ${apnManager?.activeNetwork != null})")
-            startListening()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize SIP socket on port ${profile.localSipPort}: ${e.message}", e)
+        val socket = DatagramSocket(null).apply {
+            reuseAddress = true
+            broadcast = false
         }
+        val sockId = System.identityHashCode(socket).toString(16)
+        Log.i(TAG, "SIP SOCKET CREATE id=$sockId")
+
+        socket.bind(InetSocketAddress(profile.localSipPort))
+        val localIp = socket.localAddress?.hostAddress ?: "0.0.0.0"
+        Log.i(TAG, "SIP SOCKET BIND id=$sockId local=$localIp:${socket.localPort}")
+
+        // Bind to active MCPTT network interface if available
+        apnManager?.activeNetwork?.let { net ->
+            try {
+                net.bindSocket(socket)
+                Log.i(TAG, "SIP SOCKET NETWORK BIND id=$sockId network=$net")
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not bind socket id=$sockId to network $net: ${e.message}")
+            }
+        }
+
+        sipSocket = socket
+        startListening(socket)
+        return socket
     }
 
-    private fun startListening() {
+    private fun startListening(socket: DatagramSocket) {
         listenJob?.cancel()
+        val sockId = System.identityHashCode(socket).toString(16)
         listenJob = scope.launch(Dispatchers.IO) {
             val buffer = ByteArray(8192)
-            while (isActive) {
+            while (isActive && !socket.isClosed) {
                 try {
-                    val socket = sipSocket
-                    if (socket == null || socket.isClosed) {
-                        delay(200)
-                        continue
-                    }
                     val packet = DatagramPacket(buffer, buffer.size)
                     socket.receive(packet)
                     val bytesRead = packet.length
@@ -241,13 +277,11 @@ class McpttSipStack {
                     val sourceIp = packet.address?.hostAddress ?: "unknown"
                     val sourcePort = packet.port
 
-                    Log.i(TAG, "SIP RX UDP: source=$sourceIp:$sourcePort bytes=$bytesRead")
-
                     val rawSip = String(packet.data, 0, bytesRead, Charsets.UTF_8)
-                    handleIncomingPacket(rawSip, sourceIp, sourcePort)
+                    handleIncomingPacket(rawSip, sourceIp, sourcePort, socket)
                 } catch (e: Exception) {
-                    if (isActive && sipSocket?.isClosed == false) {
-                        Log.w(TAG, "Socket receive error: ${e.message}")
+                    if (isActive && !socket.isClosed) {
+                        Log.w(TAG, "Socket id=$sockId receive error: ${e.message}")
                     }
                 }
             }
@@ -255,32 +289,34 @@ class McpttSipStack {
     }
 
     fun processIncomingSipPacket(rawSip: String, remoteHost: String = profile.pcscfHost, remotePort: Int = profile.pcscfPort) {
-        handleIncomingPacket(rawSip, remoteHost, remotePort)
+        handleIncomingPacket(rawSip, remoteHost, remotePort, sipSocket)
     }
 
-    private fun handleIncomingPacket(rawSip: String, remoteHost: String, remotePort: Int) {
+    private fun handleIncomingPacket(rawSip: String, remoteHost: String, remotePort: Int, socket: DatagramSocket? = sipSocket) {
+        val sockId = socket?.let { System.identityHashCode(it).toString(16) } ?: "unknown"
         val msg = SipMessage.parse(rawSip)
 
         val methodOrStatus = if (msg.isResponse) "${msg.statusCode} ${msg.statusText}".trim() else msg.method
-        Log.i(TAG, "SIP RX parsed: method/status=$methodOrStatus Call-ID=${msg.callId} CSeq=${msg.cseq}")
+        Log.i(TAG, "SIP RX parsed: id=$sockId method/status=$methodOrStatus Call-ID=${msg.callId} CSeq=${msg.cseq}")
 
         logTraffic(rawSip, LogDirection.INBOUND, "$remoteHost:$remotePort")
 
         if (msg.isResponse) {
-            handleResponse(msg)
+            handleResponse(msg, sockId)
         } else {
             handleRequest(msg)
         }
     }
 
-    private fun handleResponse(msg: SipMessage) {
+    private fun handleResponse(msg: SipMessage, sockId: String) {
         val method = msg.method.ifEmpty {
             val cseq = msg.getHeader("cseq")
             cseq.trim().split(Regex("\\s+")).getOrNull(1)?.uppercase() ?: ""
         }
 
         if (msg.statusCode == 401 && (registerCallId.isEmpty() || msg.callId == registerCallId)) {
-            handleRegister401(msg)
+            Log.i(TAG, "SIP RX id=$sockId status=401 callId=${msg.callId} cseq=${msg.cseqNumber}")
+            handleRegister401(msg, sockId)
             return
         }
 
@@ -291,11 +327,12 @@ class McpttSipStack {
                         _registrationState.value = RegistrationState.REGISTERED
                         _registrationFailureReason.value = null
                         registerAuthAttempts = 0
-                        Log.i(TAG, "SIP RX:\n  status=200\n  callId=${msg.callId}\n  cseq=${msg.cseq}")
+                        Log.i(TAG, "SIP RX id=$sockId status=200 callId=${msg.callId} cseq=${msg.cseqNumber}")
                         Log.i(TAG, "REGISTRATION STATE:\n  REGISTERED")
                     }
                     401 -> {
-                        handleRegister401(msg)
+                        Log.i(TAG, "SIP RX id=$sockId status=401 callId=${msg.callId} cseq=${msg.cseqNumber}")
+                        handleRegister401(msg, sockId)
                     }
                     else -> {
                         if (msg.statusCode >= 400) {
@@ -437,6 +474,13 @@ class McpttSipStack {
     }
 
     private fun sendRegisterPacket(cseq: Int, authHeader: String?) {
+        val sockId = sipSocket?.let { System.identityHashCode(it).toString(16) } ?: "unknown"
+        if (!authHeader.isNullOrBlank()) {
+            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq authorization=true")
+        } else {
+            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq")
+        }
+
         val localIp = getLocalIpAddress()
         val branch = "z9hG4bK-" + UUID.randomUUID().toString().replace("-", "").take(12)
         val uri = "sip:${profile.realm}"
@@ -472,9 +516,8 @@ class McpttSipStack {
         sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
     }
 
-    private fun handleRegister401(msg: SipMessage) {
+    private fun handleRegister401(msg: SipMessage, sockId: String) {
         val viaHeader = msg.getHeader("via")
-        Log.i(TAG, "SIP RX:\n  status=401\n  callId=${msg.callId}\n  cseq=${msg.cseq}\n  source=$viaHeader")
 
         // Guard against repeated 401 infinite loop
         if (registerAuthAttempts >= 1) {
@@ -507,7 +550,7 @@ class McpttSipStack {
             return
         }
 
-        Log.i(TAG, "DIGEST CHALLENGE:\n  realm=$realm\n  noncePresent=${nonce.isNotEmpty()}\n  qop=$qop\n  algorithm=MD5")
+        Log.i(TAG, "DIGEST AUTH id=$sockId realm=$realm noncePresent=${nonce.isNotBlank()}")
 
         // Display AUTHENTICATING (401 MD5) in UI
         _registrationState.value = RegistrationState.AUTHENTICATING
@@ -530,7 +573,6 @@ class McpttSipStack {
             nc = "00000001"
         )
 
-        Log.i(TAG, "AUTHENTICATED REGISTER SEND:\n  callId=$registerCallId\n  cseq=$registerCSeq\n  authorizationPresent=true")
         sendRegisterPacket(registerCSeq, authHeader = authHeaderValue)
         _registrationState.value = RegistrationState.REGISTERING
     }
@@ -826,22 +868,38 @@ class McpttSipStack {
 
     private fun sendRawSip(rawSip: String, destHost: String, destPort: Int) {
         onPacketSent?.invoke(rawSip, destHost, destPort)
-        scope.launch {
+
+        if (sipSocket == null || sipSocket?.isClosed == true) {
+            try {
+                initSocket()
+            } catch (e: Exception) {
+                Log.w(TAG, "Lazy socket initialization in sendRawSip failed: ${e.message}")
+            }
+        }
+
+        val socket = sipSocket
+        if (socket == null || socket.isClosed) {
+            Log.e(TAG, "Cannot send SIP: SIP socket unavailable")
+            return
+        }
+        val sockId = System.identityHashCode(socket).toString(16)
+
+        scope.launch(Dispatchers.IO) {
             try {
                 val bytes = rawSip.toByteArray(Charsets.UTF_8)
                 val targetAddr = InetAddress.getByName(destHost)
                 val packet = DatagramPacket(bytes, bytes.size, targetAddr, destPort)
-                sipSocket?.send(packet)
+                socket.send(packet)
                 logTraffic(rawSip, LogDirection.OUTBOUND, "$destHost:$destPort")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to send SIP datagram to $destHost:$destPort: ${e.message}", e)
+                Log.e(TAG, "Failed to send SIP datagram id=$sockId to $destHost:$destPort: ${e.message}", e)
             }
         }
     }
 
     fun injectSimulatedPacket(rawSip: String) {
         scope.launch {
-            handleIncomingPacket(rawSip, "127.0.0.1", profile.pcscfPort)
+            handleIncomingPacket(rawSip, "127.0.0.1", profile.pcscfPort, sipSocket)
         }
     }
 

@@ -47,6 +47,9 @@ data class SipMessage(
             return null
         }
 
+    val cseqNumber: Int
+        get() = cseq.trim().split(Regex("""\s+""")).firstOrNull()?.toIntOrNull() ?: 0
+
     fun getHeader(name: String): String = headers[name.lowercase().trim()] ?: ""
 
     fun getHeaders(name: String): List<String> = multiHeaders[name.lowercase().trim()] ?: emptyList()
@@ -140,11 +143,13 @@ data class SipMessage(
             val multiHeaders = mutableMapOf<String, MutableList<String>>()
 
             // Locate header / body separator (CRLF CRLF or LF LF)
-            val blankLineIndex = rawText.indexOf("\r\n\r\n").takeIf { it != -1 }
-                ?: rawText.indexOf("\n\n").takeIf { it != -1 }
+            val (blankLineIndex, separatorLength) = when {
+                rawText.contains("\r\n\r\n") -> Pair(rawText.indexOf("\r\n\r\n"), 4)
+                rawText.contains("\n\n") -> Pair(rawText.indexOf("\n\n"), 2)
+                else -> Pair(-1, 0)
+            }
 
-            val headerText = if (blankLineIndex != null) rawText.substring(0, blankLineIndex) else rawText
-            val body = if (blankLineIndex != null) rawText.substring(blankLineIndex).trimStart('\r', '\n') else ""
+            val headerText = if (blankLineIndex != -1) rawText.substring(0, blankLineIndex) else rawText
 
             val rawHeaderLines = headerText.lines().map { it.trimEnd('\r') }
             val unfoldedHeaderLines = mutableListOf<String>()
@@ -196,6 +201,35 @@ data class SipMessage(
                         multiHeaders.getOrPut(rawHeaderName) { mutableListOf() }.add(headerValue)
                     }
                 }
+            }
+
+            // Extract body based on parsed Content-Length in UTF-8 octets
+            val declaredContentLength = singleHeaders["content-length"]?.trim()?.toIntOrNull()
+            val body = if (blankLineIndex != -1) {
+                if (declaredContentLength != null && declaredContentLength <= 0) {
+                    ""
+                } else {
+                    val rawBytes = rawText.toByteArray(Charsets.UTF_8)
+                    val headerBytes = headerText.toByteArray(Charsets.UTF_8)
+                    val bodyStartByteIndex = headerBytes.size + separatorLength
+                    if (bodyStartByteIndex < rawBytes.size) {
+                        val availableBytes = rawBytes.size - bodyStartByteIndex
+                        val bytesToExtract = if (declaredContentLength != null) {
+                            minOf(declaredContentLength, availableBytes)
+                        } else {
+                            availableBytes
+                        }
+                        if (bytesToExtract > 0) {
+                            String(rawBytes, bodyStartByteIndex, bytesToExtract, Charsets.UTF_8)
+                        } else {
+                            ""
+                        }
+                    } else {
+                        ""
+                    }
+                }
+            } else {
+                ""
             }
 
             val cseqVal = singleHeaders["cseq"] ?: ""

@@ -55,6 +55,7 @@ class McpttApnNetworkManager(
     private var configuredApnName: String = "mcptt"
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    var onNetworkChanged: ((Network?) -> Unit)? = null
 
     fun updateConfig(apnName: String, apnPrefix: String) {
         this.configuredApnName = apnName.ifBlank { "mcptt" }
@@ -69,8 +70,6 @@ class McpttApnNetworkManager(
         }
 
         try {
-            val request = NetworkRequest.Builder().build()
-
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     Log.d(TAG, "Network available: $network")
@@ -91,12 +90,21 @@ class McpttApnNetworkManager(
                 }
 
                 override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                    scope.launch { refreshNetworkBinding() }
+                    // Do NOT rebuild or refresh transport on routine capability fluctuations (signal strength, metering)
+                    Log.d(TAG, "Capabilities changed for network $network (transport preserved)")
                 }
             }
 
             networkCallback = callback
-            cm.registerNetworkCallback(request, callback)
+            try {
+                val cellularRequest = NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+                    .build()
+                cm.registerNetworkCallback(cellularRequest, callback)
+            } catch (e: Exception) {
+                Log.w(TAG, "Cellular network callback registration failed (${e.message}), falling back to default network request")
+                cm.registerNetworkCallback(NetworkRequest.Builder().build(), callback)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register network callback: ${e.message}", e)
         }
@@ -158,15 +166,24 @@ class McpttApnNetworkManager(
                 }
             }
 
+            val prevNet = activeNetwork
+            val prevIp = boundIp
+
             if (matchedNetwork != null && matchedIp != null) {
                 activeNetwork = matchedNetwork
                 boundIp = matchedIp!!
-                _networkStatus.value = ApnNetworkStatus.Bound(
+                val newStatus = ApnNetworkStatus.Bound(
                     ip = boundIp,
                     ifaceName = matchedIface,
                     apnName = configuredApnName
                 )
-                Log.i(TAG, "Successfully bound to MCPTT APN network: $boundIp ($matchedIface) [$configuredApnName]")
+                if (_networkStatus.value != newStatus) {
+                    _networkStatus.value = newStatus
+                    Log.i(TAG, "Successfully bound to MCPTT APN network: $boundIp ($matchedIface) [$configuredApnName]")
+                }
+                if (prevNet != matchedNetwork || prevIp != matchedIp) {
+                    onNetworkChanged?.invoke(matchedNetwork)
+                }
             } else if (fallbackCellularNetwork != null && fallbackCellularIp != null) {
                 // Cellular is active, but IP does not match expected prefix (e.g. 192.168.100.x instead of 192.168.102.x)
                 activeNetwork = fallbackCellularNetwork
