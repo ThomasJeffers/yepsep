@@ -22,6 +22,7 @@ import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -107,6 +108,7 @@ class McpttSipStack {
 
     var onMediaNegotiated: ((host: String, port: Int) -> Unit)? = null
     var onFloorGranted: (() -> Unit)? = null
+    var onPacketSent: ((rawSip: String, destHost: String, destPort: Int) -> Unit)? = null
 
     fun start(context: Context, initialProfile: SipProfile) {
         this.profile = initialProfile
@@ -122,7 +124,13 @@ class McpttSipStack {
             netMgr.networkStatus.collect { netStatus ->
                 when (netStatus) {
                     is ApnNetworkStatus.Bound -> {
-                        sipSocket?.let { netMgr.bindSocket(it) }
+                        val currentLocalAddr = sipSocket?.localAddress?.hostAddress
+                        if (currentLocalAddr != netStatus.ip) {
+                            Log.i(TAG, "APN network bound to ${netStatus.ip}. Updating SIP socket binding to match ${netStatus.ip}:${profile.localSipPort}")
+                            initSocket(netStatus.ip)
+                        } else {
+                            sipSocket?.let { netMgr.bindSocket(it) }
+                        }
                         if (_registrationState.value == RegistrationState.UNREGISTERED ||
                             _registrationState.value == RegistrationState.NETWORK_UNAVAILABLE) {
                             _registrationState.value = RegistrationState.MCPTT_APN_BOUND
@@ -160,33 +168,85 @@ class McpttSipStack {
         }
     }
 
-    private fun initSocket() {
-        listenJob?.cancel()
-        sipSocket?.close()
+    private fun initSocket(targetIp: String? = null) {
+        try {
+            listenJob?.cancel()
+            sipSocket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing previous socket: ${e.message}")
+        }
 
         try {
-            val socket = DatagramSocket(profile.localSipPort)
+            val socket = DatagramSocket(null).apply {
+                reuseAddress = true
+                broadcast = false
+            }
+
+            // Pre-bind socket to cellular network interface if active
+            apnManager?.bindSocket(socket)
+
+            val localIp = targetIp ?: getLocalIpAddress()
+            val bindAddr = try {
+                if (localIp.isNotBlank() && localIp != "0.0.0.0") {
+                    InetAddress.getByName(localIp)
+                } else null
+            } catch (e: Exception) {
+                null
+            }
+
+            var boundDirectly = false
+            if (bindAddr != null) {
+                try {
+                    val socketAddress = InetSocketAddress(bindAddr, profile.localSipPort)
+                    socket.bind(socketAddress)
+                    boundDirectly = true
+                    Log.i(TAG, "SIP Stack bound directly to local IP: $localIp:${profile.localSipPort}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not bind directly to $localIp:${profile.localSipPort} (${e.message}), binding to wildcard port")
+                }
+            }
+
+            if (!boundDirectly) {
+                socket.bind(InetSocketAddress(profile.localSipPort))
+                Log.i(TAG, "SIP Stack bound to wildcard UDP port ${profile.localSipPort}")
+            }
+
+            // Bind to cellular network interface
             apnManager?.bindSocket(socket)
             sipSocket = socket
-            Log.i(TAG, "SIP Stack bound to UDP port ${profile.localSipPort} on MCPTT network")
+
+            Log.i(TAG, "SIP Stack ready on ${socket.localAddress?.hostAddress}:${socket.localPort} (MCPTT net bound: ${apnManager?.activeNetwork != null})")
             startListening()
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to bind SIP socket to port ${profile.localSipPort}: ${e.message}", e)
+            Log.e(TAG, "Failed to initialize SIP socket on port ${profile.localSipPort}: ${e.message}", e)
         }
     }
 
     private fun startListening() {
-        listenJob = scope.launch {
-            val buffer = ByteArray(4096)
+        listenJob?.cancel()
+        listenJob = scope.launch(Dispatchers.IO) {
+            val buffer = ByteArray(8192)
             while (isActive) {
                 try {
-                    val socket = sipSocket ?: break
+                    val socket = sipSocket
+                    if (socket == null || socket.isClosed) {
+                        delay(200)
+                        continue
+                    }
                     val packet = DatagramPacket(buffer, buffer.size)
                     socket.receive(packet)
-                    val rawSip = String(packet.data, 0, packet.length, Charsets.UTF_8)
-                    handleIncomingPacket(rawSip, packet.address.hostAddress ?: "", packet.port)
+                    val bytesRead = packet.length
+                    if (bytesRead <= 0) continue
+
+                    val sourceIp = packet.address?.hostAddress ?: "unknown"
+                    val sourcePort = packet.port
+
+                    Log.i(TAG, "SIP RX UDP: source=$sourceIp:$sourcePort bytes=$bytesRead")
+
+                    val rawSip = String(packet.data, 0, bytesRead, Charsets.UTF_8)
+                    handleIncomingPacket(rawSip, sourceIp, sourcePort)
                 } catch (e: Exception) {
-                    if (isActive) {
+                    if (isActive && sipSocket?.isClosed == false) {
                         Log.w(TAG, "Socket receive error: ${e.message}")
                     }
                 }
@@ -194,8 +254,16 @@ class McpttSipStack {
         }
     }
 
+    fun processIncomingSipPacket(rawSip: String, remoteHost: String = profile.pcscfHost, remotePort: Int = profile.pcscfPort) {
+        handleIncomingPacket(rawSip, remoteHost, remotePort)
+    }
+
     private fun handleIncomingPacket(rawSip: String, remoteHost: String, remotePort: Int) {
         val msg = SipMessage.parse(rawSip)
+
+        val methodOrStatus = if (msg.isResponse) "${msg.statusCode} ${msg.statusText}".trim() else msg.method
+        Log.i(TAG, "SIP RX parsed: method/status=$methodOrStatus Call-ID=${msg.callId} CSeq=${msg.cseq}")
+
         logTraffic(rawSip, LogDirection.INBOUND, "$remoteHost:$remotePort")
 
         if (msg.isResponse) {
@@ -206,15 +274,25 @@ class McpttSipStack {
     }
 
     private fun handleResponse(msg: SipMessage) {
-        when (msg.method) {
+        val method = msg.method.ifEmpty {
+            val cseq = msg.getHeader("cseq")
+            cseq.trim().split(Regex("\\s+")).getOrNull(1)?.uppercase() ?: ""
+        }
+
+        if (msg.statusCode == 401 && (registerCallId.isEmpty() || msg.callId == registerCallId)) {
+            handleRegister401(msg)
+            return
+        }
+
+        when (method) {
             "REGISTER" -> {
                 when (msg.statusCode) {
                     200 -> {
                         _registrationState.value = RegistrationState.REGISTERED
                         _registrationFailureReason.value = null
                         registerAuthAttempts = 0
-                        Log.i(TAG, "200 OK RX: SIP REGISTER 200 OK received for Call-ID=${msg.callId}")
-                        Log.i(TAG, "REGISTERED: Successfully registered to S-CSCF / IMS core")
+                        Log.i(TAG, "SIP RX:\n  status=200\n  callId=${msg.callId}\n  cseq=${msg.cseq}")
+                        Log.i(TAG, "REGISTRATION STATE:\n  REGISTERED")
                     }
                     401 -> {
                         handleRegister401(msg)
@@ -354,7 +432,7 @@ class McpttSipStack {
         registerFromTag = "reg-" + UUID.randomUUID().toString().replace("-", "").take(8)
         registerCSeq = 1
 
-        Log.i(TAG, "REGISTER TX: Sending unauthenticated REGISTER (CSeq: $registerCSeq, Call-ID: $registerCallId) to ${profile.pcscfHost}:${profile.pcscfPort}")
+        Log.i(TAG, "REGISTER SEND:\n  callId=$registerCallId\n  cseq=$registerCSeq")
         sendRegisterPacket(registerCSeq, authHeader = null)
     }
 
@@ -395,7 +473,8 @@ class McpttSipStack {
     }
 
     private fun handleRegister401(msg: SipMessage) {
-        Log.i(TAG, "401 RX: Received 401 Unauthorized challenge for Call-ID=$registerCallId")
+        val viaHeader = msg.getHeader("via")
+        Log.i(TAG, "SIP RX:\n  status=401\n  callId=${msg.callId}\n  cseq=${msg.cseq}\n  source=$viaHeader")
 
         // Guard against repeated 401 infinite loop
         if (registerAuthAttempts >= 1) {
@@ -406,7 +485,8 @@ class McpttSipStack {
         }
         registerAuthAttempts++
 
-        val authHeader = msg.getHeader("www-authenticate").ifEmpty { msg.getHeader("proxy-authenticate") }
+        val authHeaders = msg.getHeaders("www-authenticate").ifEmpty { msg.getHeaders("proxy-authenticate") }
+        val authHeader = if (authHeaders.isNotEmpty()) authHeaders.joinToString(", ") else msg.getHeader("www-authenticate").ifEmpty { msg.getHeader("proxy-authenticate") }
         if (authHeader.isBlank()) {
             Log.e(TAG, "Registration failed: 401 response missing WWW-Authenticate header")
             _registrationState.value = RegistrationState.REGISTRATION_FAILED
@@ -427,13 +507,12 @@ class McpttSipStack {
             return
         }
 
-        // Diagnostic logging: NEVER log plaintext subscriber password
-        Log.i(TAG, "Digest challenge parsed: realm='$realm', nonce='${nonce.take(8)}... (len=${nonce.length})', qop='$qop', algorithm=MD5")
+        Log.i(TAG, "DIGEST CHALLENGE:\n  realm=$realm\n  noncePresent=${nonce.isNotEmpty()}\n  qop=$qop\n  algorithm=MD5")
 
         // Display AUTHENTICATING (401 MD5) in UI
         _registrationState.value = RegistrationState.AUTHENTICATING
 
-        // RFC 3261: Increment CSeq for the authenticated REGISTER
+        // RFC 3261: Increment CSeq for the authenticated REGISTER (1 -> 2)
         registerCSeq++
 
         val uri = "sip:${profile.realm}"
@@ -451,8 +530,9 @@ class McpttSipStack {
             nc = "00000001"
         )
 
-        Log.i(TAG, "Authenticated REGISTER TX: Sending authenticated REGISTER (CSeq: $registerCSeq, username: $authUsername, realm: $realm)")
+        Log.i(TAG, "AUTHENTICATED REGISTER SEND:\n  callId=$registerCallId\n  cseq=$registerCSeq\n  authorizationPresent=true")
         sendRegisterPacket(registerCSeq, authHeader = authHeaderValue)
+        _registrationState.value = RegistrationState.REGISTERING
     }
 
     fun initiateMcpttCall(targetUri: String = profile.targetGroup) {
@@ -745,6 +825,7 @@ class McpttSipStack {
     }
 
     private fun sendRawSip(rawSip: String, destHost: String, destPort: Int) {
+        onPacketSent?.invoke(rawSip, destHost, destPort)
         scope.launch {
             try {
                 val bytes = rawSip.toByteArray(Charsets.UTF_8)
@@ -770,7 +851,17 @@ class McpttSipStack {
         val isMcptt = rawText.contains("mcptt", ignoreCase = true)
         val hasErr = rawText.startsWith("SIP/2.0 4") || rawText.startsWith("SIP/2.0 5") || rawText.startsWith("SIP/2.0 6")
 
-        val methodOrResponse = firstLine.split(" ").firstOrNull() ?: "SIP"
+        val hasAuth = rawText.contains("Authorization:", ignoreCase = true)
+        val methodOrResponse = when {
+            firstLine.startsWith("SIP/2.0 401", ignoreCase = true) -> "401"
+            firstLine.startsWith("SIP/2.0 200", ignoreCase = true) -> "200 OK"
+            firstLine.startsWith("SIP/2.0", ignoreCase = true) -> {
+                val parts = firstLine.split(" ", limit = 3)
+                if (parts.size >= 2) parts[1] else "SIP"
+            }
+            firstLine.startsWith("REGISTER", ignoreCase = true) && hasAuth -> "REGISTER + Authorization"
+            else -> firstLine.split(" ").firstOrNull() ?: "SIP"
+        }
         val logType = when {
             firstLine.startsWith("REGISTER", ignoreCase = true) -> LogType.SIP_REGISTER
             firstLine.startsWith("INVITE", ignoreCase = true) -> LogType.SIP_INVITE
@@ -798,8 +889,16 @@ class McpttSipStack {
         }
     }
 
-    private fun getLocalIpAddress(): String {
-        return apnManager?.boundIp ?: "192.168.102.2"
+    fun getLocalIpAddress(): String {
+        val netIp = apnManager?.boundIp
+        if (!netIp.isNullOrBlank() && netIp != "0.0.0.0") {
+            return netIp
+        }
+        val socketIp = sipSocket?.localAddress?.hostAddress
+        if (!socketIp.isNullOrBlank() && socketIp != "0.0.0.0") {
+            return socketIp
+        }
+        return "192.168.102.6"
     }
 
     private fun resetDialogState() {

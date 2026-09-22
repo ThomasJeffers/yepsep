@@ -8,8 +8,13 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.security.MessageDigest
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
 class SipDigestAuthTest {
 
     @Test
@@ -169,5 +174,157 @@ class SipDigestAuthTest {
         assertFalse(RegistrationState.AUTHENTICATING.isRegistered)
         assertFalse(RegistrationState.REGISTERING.isRegistered)
         assertFalse(RegistrationState.REGISTRATION_FAILED.isRegistered)
+    }
+
+    @Test
+    fun testEndToEndRegistrationFlowWith401ChallengeAnd200Ok() {
+        // Items 5, 6, 7, 8, 9, 10, 12, 13, 15 from Section 18
+        val stack = com.example.sip.engine.McpttSipStack()
+        val sentPackets = mutableListOf<String>()
+        val trafficLogs = mutableListOf<com.example.sip.model.SipTrafficLog>()
+
+        stack.onPacketSent = { rawSip, _, _ ->
+            sentPackets.add(rawSip)
+        }
+
+        val profile = com.example.sip.model.SipProfile(
+            imsi = "901700000052769",
+            mcpttId = "sip:901700000052769@ims.mnc070.mcc901.3gppnetwork.org",
+            realm = "ims.mnc070.mcc901.3gppnetwork.org",
+            password = "password123",
+            pcscfHost = "172.22.0.21",
+            localSipPort = 5062,
+            autoRegister = false
+        )
+
+        // Inject initial unauthenticated REGISTER (REGISTER #1)
+        stack.register()
+
+        assertEquals("Should have sent REGISTER #1", 1, sentPackets.size)
+        val reg1 = SipMessage.parse(sentPackets[0])
+        assertEquals("REGISTER", reg1.method)
+        assertEquals("1 REGISTER", reg1.cseq)
+        val callId1 = reg1.callId
+        val fromTag1 = reg1.from.substringAfter("tag=").substringBefore(";")
+        val via1 = reg1.getHeader("via")
+        val branch1 = via1.substringAfter("branch=").substringBefore(";")
+
+        assertTrue("Contact must contain IMSI", reg1.contact.contains("901700000052769"))
+        assertTrue("Contact must contain +g.3gpp.mcptt", reg1.contact.contains("+g.3gpp.mcptt"))
+        assertFalse("REGISTER #1 must not contain Authorization", reg1.headers.containsKey("authorization"))
+
+        // Simulate 401 Unauthorized response from P-CSCF
+        val raw401 = """
+            SIP/2.0 401 Unauthorized
+            Via: $via1
+            From: ${reg1.from}
+            To: ${reg1.to};tag=pcscf-tag99
+            Call-ID: $callId1
+            CSeq: 1 REGISTER
+            WWW-Authenticate: Digest realm="ims.mnc070.mcc901.3gppnetwork.org", nonce="95d379247d1245e0a9a4014118259dbd", algorithm=MD5, qop="auth"
+            Content-Length: 0
+
+        """.trimIndent().replace("\n", "\r\n")
+
+        stack.processIncomingSipPacket(raw401, "172.22.0.21", 5060)
+
+        // Verify REGISTER #2 was transmitted
+        assertEquals("Should have transmitted authenticated REGISTER #2", 2, sentPackets.size)
+        val reg2 = SipMessage.parse(sentPackets[1])
+
+        // Item 5: CSeq increment 1 -> 2
+        assertEquals("CSeq must increment to 2", "2 REGISTER", reg2.cseq)
+
+        // Item 6: Same Call-ID across retry
+        assertEquals("Call-ID must be identical across 401 retry", callId1, reg2.callId)
+
+        // Item 7: Same From tag across retry
+        val fromTag2 = reg2.from.substringAfter("tag=").substringBefore(";")
+        assertEquals("From tag must be identical across 401 retry", fromTag1, fromTag2)
+
+        // Item 8: New Via branch on retry
+        val via2 = reg2.getHeader("via")
+        val branch2 = via2.substringAfter("branch=").substringBefore(";")
+        assertTrue("Via branch must be non-empty", branch2.isNotEmpty())
+        assertTrue("Via branch must be different on retry", branch1 != branch2)
+
+        // Item 4 & 9: Authorization header present in REGISTER #2
+        val authHeader = reg2.getHeader("authorization")
+        assertTrue("Authorization header must be present in REGISTER #2", authHeader.isNotEmpty())
+        assertTrue("Authorization must contain Digest", authHeader.startsWith("Digest "))
+        assertTrue("Authorization must contain correct username", authHeader.contains("username=\"901700000052769@ims.mnc070.mcc901.3gppnetwork.org\""))
+        assertTrue("Authorization must contain nonce", authHeader.contains("nonce=\"95d379247d1245e0a9a4014118259dbd\""))
+        assertTrue("Authorization must contain response", authHeader.contains("response="))
+        assertTrue("Authorization must contain qop=auth", authHeader.contains("qop=auth"))
+
+        // Item 10: Authenticated REGISTER -> 200 OK -> REGISTERED
+        val raw200 = """
+            SIP/2.0 200 OK
+            Via: $via2
+            From: ${reg2.from}
+            To: ${reg2.to};tag=pcscf-tag99
+            Call-ID: $callId1
+            CSeq: 2 REGISTER
+            Contact: <sip:901700000052769@192.168.102.6:5062>;expires=3600
+            Content-Length: 0
+
+        """.trimIndent().replace("\n", "\r\n")
+
+        stack.processIncomingSipPacket(raw200, "172.22.0.21", 5060)
+
+        assertEquals("Stack state must transition to REGISTERED", RegistrationState.REGISTERED, stack.registrationState.value)
+        assertTrue(stack.registrationState.value.isRegistered)
+    }
+
+    @Test
+    fun testSecond401DoesNotCreateInfiniteLoop() {
+        // Item 11: second 401 terminates retry loop and reports failure
+        val stack = com.example.sip.engine.McpttSipStack()
+        val sentPackets = mutableListOf<String>()
+        stack.onPacketSent = { rawSip, _, _ ->
+            sentPackets.add(rawSip)
+        }
+
+        stack.register()
+        assertEquals(1, sentPackets.size)
+        val reg1 = SipMessage.parse(sentPackets[0])
+
+        // First 401 challenge
+        val raw401_1 = """
+            SIP/2.0 401 Unauthorized
+            Via: ${reg1.getHeader("via")}
+            From: ${reg1.from}
+            To: ${reg1.to}
+            Call-ID: ${reg1.callId}
+            CSeq: 1 REGISTER
+            WWW-Authenticate: Digest realm="ims.mnc070.mcc901.3gppnetwork.org", nonce="nonce1", algorithm=MD5, qop="auth"
+            Content-Length: 0
+
+        """.trimIndent().replace("\n", "\r\n")
+
+        stack.processIncomingSipPacket(raw401_1, "172.22.0.21", 5060)
+        assertEquals("Should have sent REGISTER #2", 2, sentPackets.size)
+
+        // Second 401 challenge (credentials rejected by core)
+        val reg2 = SipMessage.parse(sentPackets[1])
+        val raw401_2 = """
+            SIP/2.0 401 Unauthorized
+            Via: ${reg2.getHeader("via")}
+            From: ${reg2.from}
+            To: ${reg2.to}
+            Call-ID: ${reg2.callId}
+            CSeq: 2 REGISTER
+            WWW-Authenticate: Digest realm="ims.mnc070.mcc901.3gppnetwork.org", nonce="nonce2", algorithm=MD5, qop="auth"
+            Content-Length: 0
+
+        """.trimIndent().replace("\n", "\r\n")
+
+        stack.processIncomingSipPacket(raw401_2, "172.22.0.21", 5060)
+
+        // Must NOT send a 3rd REGISTER
+        assertEquals("Must NOT send a 3rd REGISTER on repeated 401", 2, sentPackets.size)
+        assertEquals("State must be REGISTRATION_FAILED", RegistrationState.REGISTRATION_FAILED, stack.registrationState.value)
+        assertNotNull("Failure reason must be set", stack.registrationFailureReason.value)
+        assertTrue("Failure reason must mention authentication", stack.registrationFailureReason.value!!.contains("Authentication failed"))
     }
 }

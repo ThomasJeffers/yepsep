@@ -159,7 +159,7 @@ data class SipMessage(
                         unfoldedHeaderLines[lastIdx] = unfoldedHeaderLines[lastIdx] + " " + line.trim()
                     }
                 } else if (!line.contains(":") && unfoldedHeaderLines.isNotEmpty()) {
-                    // Proxies/servers wrapping authentication headers without leading whitespace
+                    // Proxies/servers wrapping authentication or parameters without leading whitespace
                     val lastIdx = unfoldedHeaderLines.size - 1
                     unfoldedHeaderLines[lastIdx] = unfoldedHeaderLines[lastIdx] + " " + line.trim()
                 } else {

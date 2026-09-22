@@ -128,11 +128,14 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
         label = "pulseScale"
     )
 
+    val isRegistered = registrationState == RegistrationState.REGISTERED
+
     val pttColor by animateColorAsState(
-        targetValue = when (floorState) {
-            FloorState.GRANTED -> HighDensitySecondary
-            FloorState.REQUESTING -> HighDensityWarning
-            FloorState.TAKEN -> Color.Gray
+        targetValue = when {
+            !isRegistered -> Color(0xFF64748B)
+            floorState == FloorState.GRANTED -> HighDensitySecondary
+            floorState == FloorState.REQUESTING -> HighDensityWarning
+            floorState == FloorState.TAKEN -> Color.Gray
             else -> if (isPttHeld) HighDensityPttRedDark else HighDensityPttRed
         },
         label = "pttColor"
@@ -485,32 +488,39 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 .background(pttColor)
                 .border(8.dp, HighDensitySurface, CircleShape)
                 .testTag("ptt_button")
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onPress = {
-                            isPttHeld = true
-                            viewModel.onPttPressed()
-                            tryAwaitRelease()
-                            isPttHeld = false
-                            viewModel.onPttReleased()
-                        }
-                    )
+                .pointerInput(isRegistered) {
+                    if (isRegistered) {
+                        detectTapGestures(
+                            onPress = {
+                                isPttHeld = true
+                                viewModel.onPttPressed()
+                                tryAwaitRelease()
+                                isPttHeld = false
+                                viewModel.onPttReleased()
+                            }
+                        )
+                    }
                 },
             contentAlignment = Alignment.Center
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Icon(
-                    imageVector = if (isPttHeld) Icons.Default.Mic else Icons.Default.MicNone,
+                    imageVector = when {
+                        !isRegistered -> Icons.Default.MicNone
+                        isPttHeld -> Icons.Default.Mic
+                        else -> Icons.Default.MicNone
+                    },
                     contentDescription = "Push To Talk",
                     tint = Color.White,
                     modifier = Modifier.size(50.dp)
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = when (floorState) {
-                        FloorState.GRANTED -> "SPEAK NOW"
-                        FloorState.REQUESTING -> "WAIT..."
-                        FloorState.TAKEN -> "BUSY"
+                    text = when {
+                        !isRegistered -> "NOT REGISTERED"
+                        floorState == FloorState.GRANTED -> "SPEAK NOW"
+                        floorState == FloorState.REQUESTING -> "WAIT..."
+                        floorState == FloorState.TAKEN -> "BUSY"
                         else -> "PUSH TO TALK"
                     },
                     fontSize = 14.sp,

@@ -46,8 +46,9 @@ class McpttApnNetworkManager(
     private val _networkStatus = MutableStateFlow<ApnNetworkStatus>(ApnNetworkStatus.Scanning)
     val networkStatus: StateFlow<ApnNetworkStatus> = _networkStatus.asStateFlow()
 
-    private var activeNetwork: Network? = null
-    var boundIp: String = "192.168.102.2"
+    var activeNetwork: Network? = null
+        private set
+    var boundIp: String = "192.168.102.6"
         private set
 
     private var configuredApnPrefix: String = "192.168.102."
@@ -68,19 +69,16 @@ class McpttApnNetworkManager(
         }
 
         try {
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
-                .build()
+            val request = NetworkRequest.Builder().build()
 
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    Log.d(TAG, "Cellular network available: $network")
+                    Log.d(TAG, "Network available: $network")
                     scope.launch { refreshNetworkBinding() }
                 }
 
                 override fun onLost(network: Network) {
-                    Log.d(TAG, "Cellular network lost: $network")
+                    Log.d(TAG, "Network lost: $network")
                     if (activeNetwork == network) {
                         activeNetwork = null
                     }
@@ -217,7 +215,7 @@ class McpttApnNetworkManager(
         if (net != null) {
             try {
                 net.bindSocket(socket)
-                Log.i(TAG, "Bound DatagramSocket (${socket.localPort}) to Network $net")
+                Log.i(TAG, "Bound DatagramSocket (${socket.localAddress?.hostAddress ?: "unbound"}:${socket.localPort}) to Network $net")
             } catch (e: Exception) {
                 Log.w(TAG, "Could not bind socket to network $net: ${e.message}")
             }

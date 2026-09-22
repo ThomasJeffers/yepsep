@@ -117,6 +117,10 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onPttPressed() {
+        if (registrationState.value != RegistrationState.REGISTERED) {
+            android.util.Log.w("McpttViewModel", "PTT pressed ignored: client is not REGISTERED (current state: ${registrationState.value})")
+            return
+        }
         if (callState.value != CallSessionState.CONNECTED) {
             // Initiate session first if not established
             sipStack.initiateMcpttCall()
