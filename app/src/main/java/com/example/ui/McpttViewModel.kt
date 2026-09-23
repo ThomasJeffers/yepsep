@@ -196,27 +196,91 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
         sipStack.initiateMcpttCall()
     }
 
+    fun requestFloor() {
+        if (registrationState.value != RegistrationState.REGISTERED) {
+            android.util.Log.w("McpttViewModel", "requestFloor ignored: client not REGISTERED (${registrationState.value})")
+            return
+        }
+        if (callState.value != CallSessionState.CONNECTED) {
+            android.util.Log.w("McpttViewModel", "requestFloor ignored: call session is not CONNECTED (${callState.value})")
+            return
+        }
+        if (sipStack.floorState.value == FloorState.LISTENING || sipStack.floorBusy.value) {
+            android.util.Log.w("McpttViewModel", "requestFloor rejected: floor is currently busy or held by ${activeSpeaker.value}")
+            sipStack.triggerFloorBusy()
+            return
+        }
+        if (sipStack.floorState.value == FloorState.REQUESTING || sipStack.floorState.value == FloorState.GRANTED) {
+            android.util.Log.w("McpttViewModel", "requestFloor ignored: already in state ${sipStack.floorState.value}")
+            return
+        }
+        sipStack.requestFloor()
+    }
+
+    fun releaseFloor() {
+        val wasHolding = sipStack.floorState.value == FloorState.GRANTED || sipStack.floorState.value == FloorState.REQUESTING
+        pttHeld = false
+        grantTonePlayed = false
+        audioEngine.stopMicrophoneTransmission()
+        if (wasHolding) {
+            audioEngine.playReleaseTone()
+            sipStack.releaseFloor()
+            audioEngine.flushPlayback()
+        }
+    }
+
     fun onPttPressed() {
         if (registrationState.value != RegistrationState.REGISTERED) {
             android.util.Log.w("McpttViewModel", "PTT pressed: client is not REGISTERED (${registrationState.value})")
             return
         }
+
+        // When FLOOR == GRANTED: audio transmit enabled
+        if (sipStack.floorState.value == FloorState.GRANTED) {
+            pttHeld = true
+            val media = sipStack.negotiatedMedia.value
+            if (media != null) {
+                if (!grantTonePlayed) {
+                    grantTonePlayed = true
+                    audioEngine.playGrantTone()
+                }
+                audioEngine.startMicrophoneTransmission(media.host, media.rtpPort)
+            }
+            return
+        }
+
+        // When FLOOR != GRANTED: PTT button must NOT cause microphone transmission.
+        // It may initiate the already-existing call/request workflow, but never bypass floor ownership.
         if (sipStack.floorState.value == FloorState.LISTENING || sipStack.floorBusy.value) {
             android.util.Log.w("McpttViewModel", "PTT pressed while floor is taken/busy - rejecting request")
             sipStack.triggerFloorBusy()
             return
         }
-        pttHeld = true
-        sipStack.requestFloor()
+
+        if (callState.value != CallSessionState.CONNECTED) {
+            pttHeld = true
+            sipStack.requestFloor()
+            return
+        }
+
+        if (sipStack.floorState.value == FloorState.IDLE) {
+            pttHeld = true
+            sipStack.requestFloor()
+            return
+        }
     }
 
     fun onPttReleased() {
+        val wasHolding = sipStack.floorState.value == FloorState.GRANTED || sipStack.floorState.value == FloorState.REQUESTING
         pttHeld = false
         grantTonePlayed = false
         audioEngine.stopMicrophoneTransmission()
-        audioEngine.playReleaseTone()
-        sipStack.releaseFloor()
-        audioEngine.flushPlayback()
+
+        if (wasHolding) {
+            audioEngine.playReleaseTone()
+            sipStack.releaseFloor()
+            audioEngine.flushPlayback()
+        }
     }
 
     fun endCallSession() {

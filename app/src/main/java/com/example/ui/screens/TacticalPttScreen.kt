@@ -469,8 +469,8 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                         floorState == FloorState.REQUESTING -> "▲ REQUESTING FLOOR (INFO)..."
                         floorState == FloorState.LISTENING -> "■ LISTENING - ${activeSpeaker?.let { "$it IS " } ?: "REMOTE "}SPEAKING"
                         floorState == FloorState.RELEASING -> "▼ RELEASING FLOOR..."
-                        callState == CallSessionState.CONNECTED -> "Floor Idle / Ready to Transmit"
-                        else -> "Call Session Idle"
+                        callState == CallSessionState.CONNECTED -> "Floor Idle / Ready to Request"
+                        else -> "Session Idle (Connect Call First)"
                     },
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold,
@@ -484,15 +484,18 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                     fontFamily = FontFamily.Monospace
                 )
 
-                if (activeSpeaker != null) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = if (floorState == FloorState.GRANTED) "Transmitting: $activeSpeaker" else "Active Speaker: $activeSpeaker",
-                        fontSize = 11.sp,
-                        color = HighDensityTextPrimary,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = when {
+                        floorState == FloorState.GRANTED -> "Floor Holder: You (${activeSpeaker ?: profile.displayName})"
+                        floorState == FloorState.LISTENING -> "${activeSpeaker ?: "Remote User"} is speaking"
+                        floorState == FloorState.REQUESTING -> "Floor Holder: Awaiting Server Grant"
+                        else -> "Floor Holder: None (Floor Idle)"
+                    },
+                    fontSize = 11.sp,
+                    color = if (floorState == FloorState.LISTENING) HighDensityWarning else HighDensityTextPrimary,
+                    fontWeight = FontWeight.Bold
+                )
 
                 if (floorState == FloorState.GRANTED || audioLevel > 0f) {
                     Spacer(modifier = Modifier.height(8.dp))
@@ -501,7 +504,83 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
             }
         }
 
-        Spacer(modifier = Modifier.height(20.dp))
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // EXPLICIT FLOOR CONTROL BUTTON (Two-control model: 1. Session/Call, 2. Floor Control)
+        val isDialogConnected = callState == CallSessionState.CONNECTED
+        val floorButtonText = when {
+            floorBusy -> "FLOOR BUSY"
+            floorState == FloorState.LISTENING -> "LISTENING"
+            floorState == FloorState.REQUESTING -> "REQUESTING..."
+            floorState == FloorState.RELEASING -> "RELEASING"
+            floorState == FloorState.GRANTED && isPttHeld -> "SPEAKING"
+            floorState == FloorState.GRANTED -> "RELEASE FLOOR"
+            else -> "REQUEST FLOOR"
+        }
+
+        val isFloorButtonEnabled = isRegistered &&
+            isDialogConnected &&
+            !floorBusy &&
+            (floorState == FloorState.IDLE || floorState == FloorState.GRANTED)
+
+        Button(
+            onClick = {
+                if (floorState == FloorState.GRANTED) {
+                    viewModel.releaseFloor()
+                } else if (floorState == FloorState.IDLE) {
+                    viewModel.requestFloor()
+                }
+            },
+            enabled = isFloorButtonEnabled,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp)
+                .testTag("request_floor_button"),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = when {
+                    floorBusy -> HighDensityEmergency
+                    floorState == FloorState.GRANTED -> HighDensitySecondary
+                    floorState == FloorState.REQUESTING -> HighDensityWarning
+                    floorState == FloorState.LISTENING -> Color(0xFF475569)
+                    !isDialogConnected -> Color(0xFF334155)
+                    else -> HighDensityNavy
+                },
+                disabledContainerColor = when {
+                    floorBusy -> HighDensityEmergency.copy(alpha = 0.5f)
+                    floorState == FloorState.LISTENING -> Color(0xFF334155)
+                    floorState == FloorState.REQUESTING -> HighDensityWarning.copy(alpha = 0.6f)
+                    !isDialogConnected -> Color(0xFF1E293B)
+                    else -> Color(0xFF334155)
+                },
+                contentColor = Color.White,
+                disabledContentColor = Color(0xFF94A3B8)
+            ),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Icon(
+                imageVector = when {
+                    floorBusy -> Icons.Default.Warning
+                    floorState == FloorState.LISTENING -> Icons.Default.VolumeUp
+                    floorState == FloorState.GRANTED && isPttHeld -> Icons.Default.Mic
+                    floorState == FloorState.GRANTED -> Icons.Default.CheckCircle
+                    floorState == FloorState.REQUESTING -> Icons.Default.CellTower
+                    !isDialogConnected -> Icons.Default.PhoneInTalk
+                    else -> Icons.Default.CellTower
+                },
+                contentDescription = floorButtonText,
+                modifier = Modifier.size(20.dp),
+                tint = if (isFloorButtonEnabled) Color.White else Color(0xFF94A3B8)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = if (!isDialogConnected) "REQUEST FLOOR (SESSION IDLE)" else floorButtonText,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+
+        Spacer(modifier = Modifier.height(18.dp))
 
         // GIANT PTT BUTTON
         val canHoldPtt = isRegistered && floorState != FloorState.LISTENING && !floorBusy
@@ -513,7 +592,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 .background(pttColor)
                 .border(8.dp, HighDensitySurface, CircleShape)
                 .testTag("ptt_button")
-                .pointerInput(isRegistered, floorState, floorBusy) {
+                .pointerInput(isRegistered, floorState, floorBusy, callState) {
                     if (canHoldPtt) {
                         detectTapGestures(
                             onPress = {
@@ -542,7 +621,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                         floorState == FloorState.LISTENING -> Icons.Default.VolumeUp
                         floorState == FloorState.GRANTED -> Icons.Default.Mic
                         floorState == FloorState.REQUESTING -> Icons.Default.CellTower
-                        isPttHeld -> Icons.Default.Mic
+                        isPttHeld && floorState == FloorState.GRANTED -> Icons.Default.Mic
                         else -> Icons.Default.MicNone
                     },
                     contentDescription = "Push To Talk",
@@ -553,9 +632,9 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 Text(
                     text = when {
                         !isRegistered -> "NOT REGISTERED"
-                        floorBusy -> "BUSY"
-                        floorState == FloorState.GRANTED -> "SPEAK NOW"
-                        floorState == FloorState.REQUESTING -> "WAIT..."
+                        floorBusy -> "FLOOR BUSY"
+                        floorState == FloorState.GRANTED -> if (isPttHeld) "SPEAKING" else "PUSH TO TALK"
+                        floorState == FloorState.REQUESTING -> "REQUESTING..."
                         floorState == FloorState.LISTENING -> "LISTENING"
                         floorState == FloorState.RELEASING -> "RELEASING"
                         callState != CallSessionState.CONNECTED -> "START CALL"

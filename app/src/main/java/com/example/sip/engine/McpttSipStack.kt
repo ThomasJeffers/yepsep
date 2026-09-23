@@ -509,12 +509,17 @@ class McpttSipStack {
             }
             "TAKEN" -> {
                 val formattedSpeaker = formatSpeakerDisplay(speaker) ?: "Remote User"
-                if (_floorState.value == FloorState.REQUESTING) {
-                    Log.w(TAG, "Floor request denied: floor taken by $formattedSpeaker")
-                    triggerFloorBusy()
-                    _floorState.value = FloorState.LISTENING
-                    _activeSpeaker.value = formattedSpeaker
-                } else if (_floorState.value != FloorState.GRANTED) {
+                val isSelf = isSpeakerSelf(speaker)
+                if (isSelf) {
+                    _floorState.value = FloorState.GRANTED
+                    _activeSpeaker.value = profile.displayName.ifBlank { profile.mcpttId }
+                    onFloorGranted?.invoke()
+                    Log.i(TAG, "Floor TAKEN confirmed for self (now GRANTED)")
+                } else {
+                    if (_floorState.value == FloorState.REQUESTING) {
+                        Log.w(TAG, "Floor request denied: floor taken by $formattedSpeaker")
+                        triggerFloorBusy()
+                    }
                     _floorState.value = FloorState.LISTENING
                     _activeSpeaker.value = formattedSpeaker
                     Log.i(TAG, "Floor TAKEN by ${_activeSpeaker.value} (now LISTENING)")
@@ -1179,6 +1184,23 @@ class McpttSipStack {
 
     private fun md5Hex(input: String): String {
         return SipAuthHelper.md5Hex(input)
+    }
+
+    internal fun applyFloorFromBodyForTest(msg: SipMessage) {
+        applyFloorFromBody(msg)
+    }
+
+    internal fun setCallStateForTest(state: CallSessionState) {
+        _callState.value = state
+    }
+
+    internal fun setRegistrationStateForTest(state: RegistrationState) {
+        _registrationState.value = state
+    }
+
+    internal fun setFloorStateForTest(state: FloorState, speaker: String? = null) {
+        _floorState.value = state
+        _activeSpeaker.value = speaker
     }
 
     companion object {
