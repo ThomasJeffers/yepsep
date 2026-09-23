@@ -24,26 +24,29 @@ data class SipMessage(
 
     val floorControlState: String?
         get() {
-            val lower = body.lowercase()
-            for (line in lower.lines()) {
+            val lowerBody = body.lowercase()
+            for (line in lowerBody.lines()) {
                 val trimmed = line.trim()
                 if (trimmed.startsWith("action=")) {
                     val act = trimmed.substringAfter("=").trim()
                     return when {
                         act.contains("grant") -> "GRANTED"
-                        act.contains("request") -> "REQUEST"
-                        act.contains("release") -> "RELEASE"
                         act.contains("taken") -> "TAKEN"
                         act.contains("idle") -> "IDLE"
+                        act.contains("release") -> "RELEASE"
+                        act.contains("deny") || act.contains("busy") || act.contains("reject") -> "DENIED"
+                        act.contains("request") -> "REQUEST"
                         else -> act.uppercase()
                     }
                 }
             }
-            if (lower.contains("floor-granted") || lower.contains("floor-grant")) return "GRANTED"
-            if (lower.contains("floor-request")) return "REQUEST"
-            if (lower.contains("floor-release")) return "RELEASE"
-            if (lower.contains("floor-taken")) return "TAKEN"
-            if (lower.contains("floor-idle")) return "IDLE"
+            val lowerRaw = (body + "\n" + rawText).lowercase()
+            if (lowerRaw.contains("floor-granted") || lowerRaw.contains("floor-grant")) return "GRANTED"
+            if (lowerRaw.contains("floor-taken")) return "TAKEN"
+            if (lowerRaw.contains("floor-idle")) return "IDLE"
+            if (lowerRaw.contains("floor-release")) return "RELEASE"
+            if (lowerRaw.contains("floor-deny") || lowerRaw.contains("floor-busy") || lowerRaw.contains("floor-reject")) return "DENIED"
+            if (lowerRaw.contains("floor-request")) return "REQUEST"
             return null
         }
 

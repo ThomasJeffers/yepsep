@@ -71,6 +71,8 @@ fun SettingsScreen(viewModel: McpttViewModel) {
     var password by remember(currentProfile) { mutableStateOf(currentProfile.password) }
     var pcscfHost by remember(currentProfile) { mutableStateOf(currentProfile.pcscfHost) }
     var pcscfPort by remember(currentProfile) { mutableStateOf(currentProfile.pcscfPort.toString()) }
+    var mcpttAsHost by remember(currentProfile) { mutableStateOf(currentProfile.mcpttAsHost) }
+    var mcpttAsPort by remember(currentProfile) { mutableStateOf(currentProfile.mcpttAsPort.toString()) }
     var userAgent by remember(currentProfile) { mutableStateOf(currentProfile.userAgent) }
     var localSipPort by remember(currentProfile) { mutableStateOf(currentProfile.localSipPort.toString()) }
     var localRtpPort by remember(currentProfile) { mutableStateOf(currentProfile.localRtpPort.toString()) }
@@ -355,6 +357,8 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     password = password.trim(),
                     pcscfHost = pcscfHost.trim(),
                     pcscfPort = pcscfPort.toIntOrNull() ?: 5060,
+                    mcpttAsHost = mcpttAsHost.trim(),
+                    mcpttAsPort = mcpttAsPort.toIntOrNull() ?: 5060,
                     userAgent = userAgent.trim(),
                     localSipPort = localSipPort.toIntOrNull() ?: 5062,
                     localRtpPort = localRtpPort.toIntOrNull() ?: 6000,

@@ -1,15 +1,20 @@
 package com.example.sip.engine
 
 import android.annotation.SuppressLint
+import android.content.Context
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.net.Network
+import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,26 +23,30 @@ import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
 import kotlin.math.sin
 
 /**
- * High-performance RTP Audio Engine for MCPTT.
+ * High-performance RTP Audio Engine for MCPTT with speakerphone routing and keepalive.
  * Encodes/decodes G.711u (PCMU, 8000 Hz, 20ms frames = 160 samples = 160 bytes).
- * Bound to the MCPTT APN network interface via McpttApnNetworkManager.
  */
 class RtpAudioEngine {
     private val scope = CoroutineScope(Dispatchers.IO)
 
     private var rtpSocket: DatagramSocket? = null
-    private var localPort: Int = 6000
-    private var isTransmitting = false
-    private var isReceiving = false
+    @Volatile private var isTransmitting = false
+    @Volatile private var isReceiving = false
+
+    /** Strictly gates microphone / RTP transmission by floor state GRANTED */
+    @Volatile var isFloorGranted: () -> Boolean = { false }
 
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
 
     private var transmitJob: Job? = null
     private var receiveJob: Job? = null
+    private var keepaliveJob: Job? = null
 
     private val _micAudioLevel = MutableStateFlow(0f)
     val micAudioLevel: StateFlow<Float> = _micAudioLevel.asStateFlow()
@@ -49,19 +58,107 @@ class RtpAudioEngine {
     private val channelConfigIn = AudioFormat.CHANNEL_IN_MONO
     private val channelConfigOut = AudioFormat.CHANNEL_OUT_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+    private val samplesPerPacket = 160
+    private var ssrc = kotlin.random.Random.nextInt() or 1
+    private var markerNext = true
+    private var audioManager: AudioManager? = null
+    @Volatile private var rebuildTrackRequested = false
+    private val trackLock = Any()
 
-    fun init(localRtpPort: Int, apnManager: McpttApnNetworkManager? = null) {
-        try {
-            this.localPort = localRtpPort
-            rtpSocket?.close()
-            val socket = DatagramSocket(localRtpPort)
-            apnManager?.bindSocket(socket)
-            rtpSocket = socket
-            Log.i(TAG, "RTP Socket bound to port $localRtpPort on MCPTT network")
-            startAudioPlayback()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to bind RTP Socket: ${e.message}", e)
+    private val _boundPort = MutableStateFlow(0)
+    val boundPort: StateFlow<Int> = _boundPort.asStateFlow()
+    private val _rtpTxCount = MutableStateFlow(0L)
+    val rtpTxCount: StateFlow<Long> = _rtpTxCount.asStateFlow()
+    private val _rtpRxCount = MutableStateFlow(0L)
+    val rtpRxCount: StateFlow<Long> = _rtpRxCount.asStateFlow()
+
+    fun setApplication(context: Context) {
+        audioManager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
+
+    fun init(preferredPort: Int = 0, network: Network? = null, context: Context? = null): Int {
+        if (context != null) {
+            audioManager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         }
+        try {
+            rtpSocket?.close()
+            val ds = DatagramSocket(null)
+            ds.reuseAddress = true
+            if (network != null) {
+                try {
+                    network.bindSocket(ds)
+                    Log.d(TAG, "RTP socket bound to Network before port bind")
+                } catch (e: Exception) {
+                    Log.w(TAG, "RTP network bindSocket failed: ${e.message}")
+                }
+            }
+            val port = bindEvenRtpPort(ds, preferredPort)
+            ds.soTimeout = 1000
+            rtpSocket = ds
+            ssrc = kotlin.random.Random.nextInt() or 1
+            _boundPort.value = port
+            _rtpTxCount.value = 0
+            _rtpRxCount.value = 0
+            Log.i(TAG, "RTP SOCKET BOUND localPort=$port ssrc=${ssrc.toUInt()}")
+            return port
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to bind RTP Socket: ${e.message}")
+            _boundPort.value = 0
+            return 0
+        }
+    }
+
+    fun init(localRtpPort: Int, apnManager: McpttApnNetworkManager? = null, context: Context? = null): Int {
+        if (context != null) {
+            audioManager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        }
+        try {
+            rtpSocket?.close()
+            val ds = DatagramSocket(null)
+            ds.reuseAddress = true
+            if (apnManager != null) {
+                try {
+                    apnManager.bindSocket(ds)
+                } catch (e: Exception) {
+                    Log.w(TAG, "RTP apnManager bindSocket failed: ${e.message}")
+                }
+            }
+            val port = bindEvenRtpPort(ds, localRtpPort)
+            ds.soTimeout = 1000
+            rtpSocket = ds
+            ssrc = kotlin.random.Random.nextInt() or 1
+            _boundPort.value = port
+            _rtpTxCount.value = 0
+            _rtpRxCount.value = 0
+            Log.i(TAG, "RTP SOCKET BOUND localPort=$port ssrc=${ssrc.toUInt()}")
+            return port
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to bind RTP Socket: ${e.message}")
+            _boundPort.value = 0
+            return 0
+        }
+    }
+
+    private fun bindEvenRtpPort(ds: DatagramSocket, preferred: Int): Int {
+        val start = if (preferred >= 1024 && preferred % 2 == 0) {
+            preferred
+        } else if (preferred >= 1024) {
+            preferred + 1
+        } else {
+            40000 + kotlin.random.Random.nextInt(0, 800) * 2
+        }
+        var lastError: Exception? = null
+        for (p in start until start + 400 step 2) {
+            try {
+                ds.bind(InetSocketAddress(p))
+                return ds.localPort
+            } catch (e: Exception) {
+                lastError = e
+            }
+        }
+        ds.bind(InetSocketAddress(0))
+        Log.w(TAG, "RTP fell back to ephemeral port ${ds.localPort} (${lastError?.message})")
+        return ds.localPort
     }
 
     fun setRemoteMediaTarget(host: String, port: Int) {
@@ -136,7 +233,14 @@ class RtpAudioEngine {
             return
         }
 
+        if (!isFloorGranted()) {
+            Log.w(TAG, "Cannot start RTP transmission: floor is NOT granted")
+            return
+        }
+
         isTransmitting = true
+        markerNext = true
+
         transmitJob = scope.launch {
             val minBufSize = AudioRecord.getMinBufferSize(
                 sampleRate,
@@ -160,64 +264,29 @@ class RtpAudioEngine {
                 }
 
                 audioRecord?.startRecording()
-                val pcmBuffer = ShortArray(160) // 20ms frames at 8kHz = 160 samples
+                val buffer = ShortArray(samplesPerPacket)
                 val targetAddr = InetAddress.getByName(targetHost)
                 var sequenceNum = 0
                 var timestamp = 0L
-                val ssrc = 0x12345678
+                Log.i(TAG, "Mic TX started -> $targetHost:$targetPort PCMU/8000")
 
-                Log.i(TAG, "Microphone RTP streaming started to $targetHost:$targetPort (PCMU/8000)")
-
-                while (isTransmitting && isActive) {
-                    val readSamples = audioRecord?.read(pcmBuffer, 0, pcmBuffer.size) ?: 0
+                while (isTransmitting && isActive && isFloorGranted()) {
+                    val readSamples = audioRecord?.read(buffer, 0, buffer.size) ?: 0
                     if (readSamples > 0) {
-                        // Calculate audio amplitude for UI visualizer
                         var sum = 0.0
                         for (i in 0 until readSamples) {
-                            sum += pcmBuffer[i] * pcmBuffer[i]
+                            sum += buffer[i] * buffer[i]
                         }
                         val amplitude = Math.sqrt(sum / readSamples)
                         _micAudioLevel.value = (amplitude / 32768.0).toFloat().coerceIn(0f, 1f)
 
-                        // Format RTP packet: 12-byte header + PCMU payload (1 byte per sample)
-                        val rtpPacketData = ByteArray(12 + readSamples)
-                        // V=2, P=0, X=0, CC=0 -> 0x80
-                        rtpPacketData[0] = 0x80.toByte()
-                        // M=0, PT=0 (PCMU) -> 0x00
-                        rtpPacketData[1] = 0x00.toByte()
-                        // Sequence Number
-                        rtpPacketData[2] = ((sequenceNum shr 8) and 0xFF).toByte()
-                        rtpPacketData[3] = (sequenceNum and 0xFF).toByte()
-                        // Timestamp
-                        rtpPacketData[4] = ((timestamp shr 24) and 0xFF).toByte()
-                        rtpPacketData[5] = ((timestamp shr 16) and 0xFF).toByte()
-                        rtpPacketData[6] = ((timestamp shr 8) and 0xFF).toByte()
-                        rtpPacketData[7] = (timestamp and 0xFF).toByte()
-                        // SSRC
-                        rtpPacketData[8] = ((ssrc shr 24) and 0xFF).toByte()
-                        rtpPacketData[9] = ((ssrc shr 16) and 0xFF).toByte()
-                        rtpPacketData[10] = ((ssrc shr 8) and 0xFF).toByte()
-                        rtpPacketData[11] = (ssrc and 0xFF).toByte()
-
-                        // Encode PCM to G.711u
-                        for (i in 0 until readSamples) {
-                            rtpPacketData[12 + i] = linear16ToUlaw(pcmBuffer[i])
-                        }
-
-                        val packet = DatagramPacket(
-                            rtpPacketData,
-                            rtpPacketData.size,
-                            targetAddr,
-                            targetPort
-                        )
-                        rtpSocket?.send(packet)
-
+                        sendPcmuFrame(buffer, readSamples, targetAddr, targetPort, sequenceNum, timestamp)
                         sequenceNum = (sequenceNum + 1) and 0xFFFF
                         timestamp += readSamples
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Transmission loop error: ${e.message}", e)
+                Log.e(TAG, "Transmission loop error: ${e.message}")
             } finally {
                 try {
                     audioRecord?.stop()
@@ -237,6 +306,51 @@ class RtpAudioEngine {
         transmitJob?.cancel()
         transmitJob = null
         _micAudioLevel.value = 0f
+        applyPlaybackRouting()
+        rebuildTrackRequested = true
+    }
+
+    fun sendMediaBindingProbe(destHost: String, destPort: Int) {
+        scope.launch {
+            try {
+                val targetAddr = InetAddress.getByName(destHost)
+                val probe = ByteArray(12)
+                probe[0] = 0x80.toByte()
+                probe[1] = 0x00.toByte()
+                probe[2] = 0x00.toByte()
+                probe[3] = 0x01.toByte()
+                probe[8] = ((ssrc shr 24) and 0xFF).toByte()
+                probe[9] = ((ssrc shr 16) and 0xFF).toByte()
+                probe[10] = ((ssrc shr 8) and 0xFF).toByte()
+                probe[11] = (ssrc and 0xFF).toByte()
+                val packet = DatagramPacket(probe, probe.size, targetAddr, destPort)
+                rtpSocket?.send(packet)
+                Log.i(TAG, "Sent media binding probe to $destHost:$destPort")
+            } catch (e: Exception) {
+                Log.w(TAG, "Media binding probe error: ${e.message}")
+            }
+        }
+    }
+
+    fun startNatKeepalive(destHost: String, destPort: Int) {
+        sendMediaBindingProbe(destHost, destPort)
+    }
+
+    fun stopNatKeepalive() {
+        keepaliveJob?.cancel()
+        keepaliveJob = null
+    }
+
+    fun flushPlayback() {
+        synchronized(trackLock) {
+            try {
+                audioTrack?.pause()
+                audioTrack?.flush()
+                audioTrack?.play()
+            } catch (e: Exception) {
+                Log.w(TAG, "flushPlayback error: ${e.message}")
+            }
+        }
     }
 
     fun startAudioPlayback() {
@@ -251,39 +365,63 @@ class RtpAudioEngine {
             )
 
             try {
-                audioTrack = AudioTrack(
-                    AudioManager.STREAM_MUSIC,
-                    sampleRate,
-                    channelConfigOut,
-                    audioFormat,
-                    minBufSize * 2,
-                    AudioTrack.MODE_STREAM
-                )
+                applyPlaybackRouting()
+                audioTrack = buildPlaybackTrack(minBufSize)
                 audioTrack?.play()
 
-                val recvBuf = ByteArray(1500)
+                val recvBuf = ByteArray(2048)
                 val packet = DatagramPacket(recvBuf, recvBuf.size)
+                Log.i(TAG, "RTP playback started")
 
                 while (isReceiving && isActive) {
-                    val socket = rtpSocket ?: break
-                    socket.receive(packet)
-                    val len = packet.length
-                    if (len > 12) {
-                        val payloadLen = len - 12
-                        val pcmShorts = ShortArray(payloadLen)
-
-                        // Decode G.711u to linear PCM 16-bit
-                        for (i in 0 until payloadLen) {
-                            pcmShorts[i] = ulawToLinear16(recvBuf[12 + i])
+                    if (rebuildTrackRequested) {
+                        rebuildTrackRequested = false
+                        synchronized(trackLock) {
+                            try {
+                                audioTrack?.stop()
+                                audioTrack?.release()
+                            } catch (_: Exception) {
+                            }
+                            audioTrack = buildPlaybackTrack(minBufSize)
+                            applyPlaybackRouting()
+                            audioTrack?.play()
+                            Log.i(TAG, "RTP AudioTrack rebuilt after PTT (speaker routing)")
                         }
-
+                    }
+                    try {
+                        rtpSocket?.receive(packet)
+                    } catch (_: SocketTimeoutException) {
+                        continue
+                    }
+                    if (isTransmitting) continue
+                    val len = packet.length
+                    if (len <= 12) continue
+                    _rtpRxCount.value = _rtpRxCount.value + 1
+                    if (_rtpRxCount.value == 1L) {
+                        Log.i(TAG, "RTP RX first packet from ${packet.address.hostAddress}:${packet.port} len=$len")
+                    }
+                    val payloadLen = len - 12
+                    val pcmShorts = when {
+                        payloadLen == samplesPerPacket -> {
+                            ShortArray(payloadLen) { i -> ulawToLinear(recvBuf[12 + i].toInt() and 0xFF) }
+                        }
+                        payloadLen == samplesPerPacket * 2 -> {
+                            ShortArray(samplesPerPacket) { i ->
+                                val low = recvBuf[12 + i * 2].toInt() and 0xFF
+                                val high = recvBuf[12 + i * 2 + 1].toInt()
+                                ((high shl 8) or low).toShort()
+                            }
+                        }
+                        else -> {
+                            ShortArray(payloadLen) { i -> ulawToLinear(recvBuf[12 + i].toInt() and 0xFF) }
+                        }
+                    }
+                    synchronized(trackLock) {
                         audioTrack?.write(pcmShorts, 0, pcmShorts.size)
                     }
                 }
             } catch (e: Exception) {
-                if (isReceiving) {
-                    Log.e(TAG, "RTP receive playback error: ${e.message}")
-                }
+                Log.e(TAG, "RTP receive playback error: ${e.message}")
             } finally {
                 try {
                     audioTrack?.stop()
@@ -292,6 +430,7 @@ class RtpAudioEngine {
                 } catch (e: Exception) {
                     Log.e(TAG, "Clean up speaker error: ${e.message}")
                 }
+                isReceiving = false
             }
         }
     }
@@ -302,56 +441,134 @@ class RtpAudioEngine {
         receiveJob = null
     }
 
+    fun applyPlaybackRouting() {
+        val am = audioManager ?: return
+        try {
+            am.mode = AudioManager.MODE_IN_COMMUNICATION
+            am.isSpeakerphoneOn = true
+            val stream = AudioManager.STREAM_VOICE_CALL
+            val max = am.getStreamMaxVolume(stream)
+            if (max > 0) {
+                am.setStreamVolume(stream, max, 0)
+            }
+            if (Build.VERSION.SDK_INT >= 26) {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                val req = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(attrs)
+                    .build()
+                am.requestAudioFocus(req)
+            } else {
+                @Suppress("DEPRECATION")
+                am.requestAudioFocus(null, stream, AudioManager.AUDIOFOCUS_GAIN)
+            }
+            synchronized(trackLock) {
+                audioTrack?.setVolume(1f)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Playback routing: ${e.message}")
+        }
+    }
+
+    private fun buildPlaybackTrack(minBufSize: Int): AudioTrack {
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(channelConfigOut)
+                    .build()
+            )
+            .setBufferSizeInBytes(minBufSize * 2)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        track.setVolume(1f)
+        return track
+    }
+
     fun close() {
         stopMicrophoneTransmission()
+        stopNatKeepalive()
         stopAudioPlayback()
         rtpSocket?.close()
         rtpSocket = null
     }
 
+    private fun sendPcmuFrame(
+        samples: ShortArray,
+        count: Int,
+        dest: InetAddress,
+        destPort: Int,
+        sequenceNum: Int,
+        timestamp: Long
+    ) {
+        if (!isFloorGranted()) {
+            return
+        }
+        val payloadLen = count.coerceAtMost(samples.size)
+        val rtp = ByteArray(12 + payloadLen)
+        rtp[0] = 0x80.toByte()
+        rtp[1] = if (markerNext) 0x80.toByte() else 0x00
+        markerNext = false
+        rtp[2] = ((sequenceNum shr 8) and 0xFF).toByte()
+        rtp[3] = (sequenceNum and 0xFF).toByte()
+        rtp[4] = ((timestamp shr 24) and 0xFF).toByte()
+        rtp[5] = ((timestamp shr 16) and 0xFF).toByte()
+        rtp[6] = ((timestamp shr 8) and 0xFF).toByte()
+        rtp[7] = (timestamp and 0xFF).toByte()
+        rtp[8] = ((ssrc shr 24) and 0xFF).toByte()
+        rtp[9] = ((ssrc shr 16) and 0xFF).toByte()
+        rtp[10] = ((ssrc shr 8) and 0xFF).toByte()
+        rtp[11] = (ssrc and 0xFF).toByte()
+        for (i in 0 until payloadLen) {
+            rtp[12 + i] = linearToUlaw(samples[i])
+        }
+        val packet = DatagramPacket(rtp, rtp.size, dest, destPort)
+        rtpSocket?.send(packet)
+        _rtpTxCount.value = _rtpTxCount.value + 1
+    }
+
     companion object {
         private const val TAG = "RtpAudioEngine"
+        private const val BIAS = 0x84
+        private const val CLIP = 32635
 
-        /**
-         * Converts 16-bit linear PCM sample to 8-bit G.711 mu-law byte.
-         */
-        fun linear16ToUlaw(sample: Short): Byte {
+        fun linearToUlaw(sample: Short): Byte {
             var pcm = sample.toInt()
-            val sign = if (pcm < 0) {
+            val mask = if (pcm < 0) {
                 pcm = -pcm
-                0x80
+                0x7F
             } else {
-                0x00
+                0xFF
             }
-
-            pcm += 132 // 0x84
-            if (pcm > 32767) pcm = 32767
-
+            if (pcm > CLIP) pcm = CLIP
+            pcm += BIAS
             var exponent = 7
             var expMask = 0x4000
-            while ((pcm and expMask) == 0 && exponent > 0) {
+            while (exponent > 0 && (pcm and expMask) == 0) {
                 exponent--
                 expMask = expMask shr 1
             }
-
             val mantissa = (pcm shr (exponent + 3)) and 0x0F
-            val ulaw = (sign or (exponent shl 4) or mantissa) xor 0xFF
-            return ulaw.toByte()
+            return (((exponent shl 4) or mantissa).inv() and mask).toByte()
         }
 
-        /**
-         * Converts 8-bit G.711 mu-law byte to 16-bit linear PCM sample.
-         */
-        fun ulawToLinear16(ulawByte: Byte): Short {
-            val ulaw = (ulawByte.toInt() xor 0xFF) and 0xFF
-            val sign = ulaw and 0x80
-            val exponent = (ulaw shr 4) and 0x07
-            val mantissa = ulaw and 0x0F
-
-            var sample = ((mantissa shl 3) + 132) shl exponent
-            sample -= 132
-
-            return if (sign != 0) (-sample).toShort() else sample.toShort()
+        fun ulawToLinear(ulawByte: Int): Short {
+            val u = (ulawByte.inv() and 0xFF)
+            val t = (((u and 0x0F) shl 3) + BIAS) shl (u shr 4 and 0x07)
+            return (if ((u and 0x80) != 0) (BIAS - t) else (t - BIAS)).toShort()
         }
+
+        /** Backward compatible delegates for existing tests */
+        fun linear16ToUlaw(sample: Short): Byte = linearToUlaw(sample)
+        fun ulawToLinear16(ulawByte: Byte): Short = ulawToLinear(ulawByte.toInt() and 0xFF)
     }
 }

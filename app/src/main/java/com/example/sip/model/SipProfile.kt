@@ -7,9 +7,11 @@ data class SipProfile(
     val imsi: String = "901700000052769",
     val mcpttId: String = "sip:901700000052769@ims.mnc070.mcc901.3gppnetwork.org",
     val realm: String = "ims.mnc070.mcc901.3gppnetwork.org",
-    val password: String = "password123",
+    val password: String = "2D97C18692BDA7F1D44A7275E414FD8D",
     val pcscfHost: String = "172.22.0.21",
     val pcscfPort: Int = 5060,
+    val mcpttAsHost: String = "172.30.104.240",
+    val mcpttAsPort: Int = 5070,
     val scscfOrigRoute: String = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:6060;lr",
     val asFallbackUri: String = "sip:172.30.104.240:5070;transport=udp",
     val userAgent: String = "MCPTT-Exp5-UAC",
@@ -21,4 +23,8 @@ data class SipProfile(
     val autoRegister: Boolean = true,
     val includeMcpttTags: Boolean = true,
     val autoGrantFloor: Boolean = false
-)
+) {
+    fun sipDestinationHost(): String = pcscfHost
+    fun sipDestinationPort(): Int = pcscfPort
+    fun sipDestinationLabel(): String = "P-CSCF → ${pcscfHost}:${pcscfPort}"
+}

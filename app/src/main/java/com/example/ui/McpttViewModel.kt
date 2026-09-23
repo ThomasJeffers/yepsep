@@ -10,7 +10,9 @@ import com.example.data.McpttRepository
 import com.example.sip.engine.ApnNetworkStatus
 import com.example.sip.engine.CallSessionState
 import com.example.sip.engine.FloorState
+import com.example.sip.engine.IncomingChatMessage
 import com.example.sip.engine.McpttSipStack
+import com.example.sip.engine.NegotiatedMedia
 import com.example.sip.engine.RegistrationState
 import com.example.sip.engine.RtpAudioEngine
 import com.example.sip.model.LogDirection
@@ -39,7 +41,17 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
     val callState: StateFlow<CallSessionState> = sipStack.callState
     val floorState: StateFlow<FloorState> = sipStack.floorState
     val activeSpeaker: StateFlow<String?> = sipStack.activeSpeaker
+    val floorBusy: StateFlow<Boolean> = sipStack.floorBusy
     val micAudioLevel: StateFlow<Float> = audioEngine.micAudioLevel
+
+    val negotiatedMedia: StateFlow<NegotiatedMedia?> = sipStack.negotiatedMedia
+    val rtpTxCount: StateFlow<Long> = audioEngine.rtpTxCount
+    val rtpRxCount: StateFlow<Long> = audioEngine.rtpRxCount
+    val boundRtpPort: StateFlow<Int> = audioEngine.boundPort
+    val incomingMessages: StateFlow<List<IncomingChatMessage>> = sipStack.incomingMessages
+
+    private var pttHeld = false
+    private var grantTonePlayed = false
 
     val apnNetworkStatus: StateFlow<ApnNetworkStatus> =
         sipStack.apnManager?.networkStatus ?: MutableStateFlow(ApnNetworkStatus.Scanning)
@@ -68,18 +80,85 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         val currentProfile = repository.sipProfile.value
-        sipStack.start(getApplication(), currentProfile)
+        audioEngine.setApplication(application)
+        audioEngine.isFloorGranted = { sipStack.floorState.value == FloorState.GRANTED }
         audioEngine.init(currentProfile.localRtpPort, sipStack.apnManager)
+        sipStack.setLocalRtpPort(audioEngine.boundPort.value)
+        sipStack.start(getApplication(), currentProfile)
 
-        // Wire media negotiation from SIP INVITE 200 OK
+        // Wire media negotiation from SIP INVITE / 200 OK
         sipStack.onMediaNegotiated = { remoteIp, remotePort ->
             audioEngine.setRemoteMediaTarget(remoteIp, remotePort)
+            if (pttHeld && sipStack.floorState.value == FloorState.GRANTED) {
+                audioEngine.startMicrophoneTransmission(remoteIp, remotePort)
+            }
         }
 
         // Wire floor grant callback
         sipStack.onFloorGranted = {
-            audioEngine.playGrantTone()
-            audioEngine.startMicrophoneTransmission()
+            if (pttHeld && !grantTonePlayed) {
+                grantTonePlayed = true
+                audioEngine.playGrantTone()
+            }
+            val media = sipStack.negotiatedMedia.value
+            if (pttHeld && media != null) {
+                audioEngine.startMicrophoneTransmission(media.host, media.rtpPort)
+            }
+        }
+
+        viewModelScope.launch {
+            audioEngine.boundPort.collect { port ->
+                sipStack.setLocalRtpPort(port)
+            }
+        }
+
+        viewModelScope.launch {
+            combine(sipStack.callState, sipStack.negotiatedMedia) { state, media ->
+                state to media
+            }.collect { (state, media) ->
+                if (state == CallSessionState.CONNECTED && media != null) {
+                    audioEngine.startAudioPlayback()
+                    audioEngine.sendMediaBindingProbe(media.host, media.rtpPort)
+                } else if (state == CallSessionState.IDLE || state == CallSessionState.DISCONNECTING) {
+                    audioEngine.stopMicrophoneTransmission()
+                    audioEngine.stopNatKeepalive()
+                    audioEngine.stopAudioPlayback()
+                    grantTonePlayed = false
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            combine(sipStack.floorState, sipStack.negotiatedMedia) { state, media ->
+                state to media
+            }.collect { (state, media) ->
+                when (state) {
+                    FloorState.GRANTED -> {
+                        if (pttHeld && media != null) {
+                            if (!grantTonePlayed) {
+                                grantTonePlayed = true
+                                audioEngine.playGrantTone()
+                            }
+                            audioEngine.startMicrophoneTransmission(media.host, media.rtpPort)
+                        }
+                    }
+                    FloorState.LISTENING -> {
+                        grantTonePlayed = false
+                        audioEngine.stopMicrophoneTransmission()
+                        audioEngine.flushPlayback()
+                        audioEngine.applyPlaybackRouting()
+                    }
+                    FloorState.IDLE, FloorState.RELEASING -> {
+                        grantTonePlayed = false
+                        audioEngine.stopMicrophoneTransmission()
+                        audioEngine.flushPlayback()
+                        audioEngine.applyPlaybackRouting()
+                    }
+                    FloorState.REQUESTING -> {
+                        // Awaiting grant confirmation from AS before unmuting
+                    }
+                }
+            }
         }
 
         viewModelScope.launch {
@@ -93,6 +172,7 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
         repository.saveProfile(profile)
         sipStack.updateProfile(getApplication(), profile)
         audioEngine.init(profile.localRtpPort, sipStack.apnManager)
+        sipStack.setLocalRtpPort(audioEngine.boundPort.value)
     }
 
     fun registerSip() {
@@ -118,26 +198,49 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onPttPressed() {
         if (registrationState.value != RegistrationState.REGISTERED) {
-            android.util.Log.w("McpttViewModel", "PTT pressed ignored: client is not REGISTERED (current state: ${registrationState.value})")
+            android.util.Log.w("McpttViewModel", "PTT pressed: client is not REGISTERED (${registrationState.value})")
             return
         }
-        if (callState.value != CallSessionState.CONNECTED) {
-            // Initiate session first if not established
-            sipStack.initiateMcpttCall()
+        if (sipStack.floorState.value == FloorState.LISTENING || sipStack.floorBusy.value) {
+            android.util.Log.w("McpttViewModel", "PTT pressed while floor is taken/busy - rejecting request")
+            sipStack.triggerFloorBusy()
+            return
         }
+        pttHeld = true
         sipStack.requestFloor()
     }
 
     fun onPttReleased() {
-        audioEngine.playReleaseTone()
+        pttHeld = false
+        grantTonePlayed = false
         audioEngine.stopMicrophoneTransmission()
+        audioEngine.playReleaseTone()
         sipStack.releaseFloor()
+        audioEngine.flushPlayback()
     }
 
     fun endCallSession() {
+        pttHeld = false
+        grantTonePlayed = false
         audioEngine.stopMicrophoneTransmission()
+        audioEngine.stopNatKeepalive()
         audioEngine.stopAudioPlayback()
         sipStack.endCall()
+    }
+
+    fun onAppBackgrounded() {
+        if (sipStack.floorState.value == FloorState.GRANTED || sipStack.floorState.value == FloorState.REQUESTING) {
+            android.util.Log.i("McpttViewModel", "App backgrounded while holding/requesting floor - releasing cleanly")
+            onPttReleased()
+        }
+    }
+
+    fun onAppResumed() {
+        val media = sipStack.negotiatedMedia.value
+        if (sipStack.callState.value == CallSessionState.CONNECTED && media != null) {
+            audioEngine.startAudioPlayback()
+            audioEngine.sendMediaBindingProbe(media.host, media.rtpPort)
+        }
     }
 
     fun triggerEmergencyAlert(customNote: String = "EMERGENCY SOS ALERT") {

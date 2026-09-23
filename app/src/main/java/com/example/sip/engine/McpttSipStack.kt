@@ -49,8 +49,21 @@ enum class FloorState {
     IDLE,
     REQUESTING,
     GRANTED,
-    TAKEN
+    RELEASING,
+    LISTENING
 }
+
+data class NegotiatedMedia(
+    val host: String,
+    val rtpPort: Int,
+    val rtcpPort: Int = rtpPort + 1
+)
+
+data class IncomingChatMessage(
+    val from: String,
+    val text: String,
+    val timestamp: Long = System.currentTimeMillis()
+)
 
 class McpttSipStack {
     private val scope = CoroutineScope(Dispatchers.IO)
@@ -73,14 +86,42 @@ class McpttSipStack {
     private val _activeSpeaker = MutableStateFlow<String?>(null)
     val activeSpeaker: StateFlow<String?> = _activeSpeaker.asStateFlow()
 
-    private val _trafficLogs = MutableSharedFlow<SipTrafficLog>(replay = 50)
-    val trafficLogs: SharedFlow<SipTrafficLog> = _trafficLogs.asSharedFlow()
+    private val _floorBusy = MutableStateFlow(false)
+    val floorBusy: StateFlow<Boolean> = _floorBusy.asStateFlow()
+    private var floorBusyJob: Job? = null
+
+    fun triggerFloorBusy() {
+        _floorBusy.value = true
+        floorBusyJob?.cancel()
+        floorBusyJob = scope.launch {
+            delay(2500)
+            _floorBusy.value = false
+        }
+    }
 
     var profile = SipProfile()
         private set
 
     var apnManager: McpttApnNetworkManager? = null
         private set
+
+    private val _negotiatedMedia = MutableStateFlow<NegotiatedMedia?>(null)
+    val negotiatedMedia: StateFlow<NegotiatedMedia?> = _negotiatedMedia.asStateFlow()
+
+    private val _incomingMessages = MutableStateFlow<List<IncomingChatMessage>>(emptyList())
+    val incomingMessages: StateFlow<List<IncomingChatMessage>> = _incomingMessages.asStateFlow()
+
+    private val _localRtpPort = MutableStateFlow(profile.localRtpPort)
+    val localRtpPort: StateFlow<Int> = _localRtpPort.asStateFlow()
+
+    fun setLocalRtpPort(port: Int) {
+        _localRtpPort.value = port
+    }
+
+    private var pendingFloorRequest = false
+
+    private val _trafficLogs = MutableSharedFlow<SipTrafficLog>(replay = 50)
+    val trafficLogs: SharedFlow<SipTrafficLog> = _trafficLogs.asSharedFlow()
 
     // SIP Dialog and Session State
     private var registerCallId = UUID.randomUUID().toString()
@@ -345,10 +386,10 @@ class McpttSipStack {
                 }
             }
             "INVITE" -> {
-                when (msg.statusCode) {
-                    200 -> {
+                when {
+                    msg.statusCode == 200 || msg.statusCode == 202 -> {
                         _callState.value = CallSessionState.CONNECTED
-                        Log.i(TAG, "SIP INVITE 200 OK - Call established")
+                        Log.i(TAG, "SIP INVITE ${msg.statusCode} ${msg.statusText} - Call established")
 
                         // Extract dialog state
                         activeCallToTag = extractTag(msg.to)
@@ -358,36 +399,34 @@ class McpttSipStack {
                         activeRouteSet = msg.extractUacRouteSet()
 
                         // Extract SDP media information
-                        val (sdpIp, sdpPort) = msg.extractSdpMedia()
-                        if (sdpIp != null && sdpPort != null) {
-                            remoteMediaIp = sdpIp
-                            remoteMediaPort = sdpPort
-                            Log.i(TAG, "Negotiated remote media: $sdpIp:$sdpPort")
-                            onMediaNegotiated?.invoke(sdpIp, sdpPort)
-                        } else {
-                            // Fallback to P-CSCF / AS host if not parsed
-                            remoteMediaIp = profile.pcscfHost
-                            remoteMediaPort = profile.localRtpPort
-                            onMediaNegotiated?.invoke(remoteMediaIp!!, remoteMediaPort!!)
-                        }
+                        applySdpAnswer(msg.body)
 
                         // Send ACK
                         sendAck(msg)
 
-                        if (profile.autoGrantFloor) {
+                        if (pendingFloorRequest) {
+                            pendingFloorRequest = false
+                            sendFloorControlMessage("floor-request")
+                        } else if (profile.autoGrantFloor) {
                             _floorState.value = FloorState.GRANTED
                             _activeSpeaker.value = profile.displayName
                             onFloorGranted?.invoke()
                         }
                     }
-                    180, 183 -> {
+                    msg.statusCode in 100..199 -> {
+                        if (msg.body.contains("m=audio")) {
+                            applySdpAnswer(msg.body)
+                        }
                         _callState.value = CallSessionState.CALLING
-                        Log.i(TAG, "SIP INVITE ${msg.statusCode} ${msg.statusText} (Ringing/Session Progress)")
+                        Log.i(TAG, "SIP INVITE ${msg.statusCode} ${msg.statusText} (Session Progress)")
                     }
                     else -> {
                         if (msg.statusCode >= 400) {
                             _callState.value = CallSessionState.IDLE
                             _floorState.value = FloorState.IDLE
+                            _activeSpeaker.value = null
+                            _negotiatedMedia.value = null
+                            pendingFloorRequest = false
                             Log.e(TAG, "SIP INVITE failed with status ${msg.statusCode} ${msg.statusText}")
                         }
                     }
@@ -395,11 +434,15 @@ class McpttSipStack {
             }
             "INFO" -> {
                 Log.d(TAG, "In-dialog INFO response: ${msg.statusCode} ${msg.statusText}")
+                applyFloorFromBody(msg)
             }
             "BYE" -> {
                 _callState.value = CallSessionState.IDLE
                 _floorState.value = FloorState.IDLE
                 _activeSpeaker.value = null
+                _negotiatedMedia.value = null
+                pendingFloorRequest = false
+                resetDialogState()
             }
         }
     }
@@ -416,35 +459,14 @@ class McpttSipStack {
                 activeRemoteTargetUri = msg.extractContactUri().ifEmpty { msg.from }
                 activeRouteSet = msg.extractUacRouteSet()
 
-                val (sdpIp, sdpPort) = msg.extractSdpMedia()
-                if (sdpIp != null && sdpPort != null) {
-                    remoteMediaIp = sdpIp
-                    remoteMediaPort = sdpPort
-                    onMediaNegotiated?.invoke(sdpIp, sdpPort)
-                }
-
+                applySdpAnswer(msg.body)
                 send200OkForInvite(msg)
             }
             "INFO" -> {
                 // Floor Control Action from AS
-                val floorAction = msg.floorControlState
-                Log.i(TAG, "Received in-dialog INFO: floorAction=$floorAction, body=${msg.body}")
-                when (floorAction) {
-                    "GRANTED" -> {
-                        _floorState.value = FloorState.GRANTED
-                        _activeSpeaker.value = "${profile.displayName} (Floor Granted)"
-                        onFloorGranted?.invoke()
-                    }
-                    "TAKEN" -> {
-                        _floorState.value = FloorState.TAKEN
-                        _activeSpeaker.value = extractSpeakerFromInfo(msg.body) ?: "Remote Unit"
-                    }
-                    "RELEASE", "IDLE" -> {
-                        _floorState.value = FloorState.IDLE
-                        _activeSpeaker.value = null
-                    }
-                }
+                Log.i(TAG, "Received in-dialog INFO: floorAction=${msg.floorControlState}, body=${msg.body}")
                 sendResponse(200, "OK", msg)
+                applyFloorFromBody(msg)
             }
             "BYE" -> {
                 Log.i(TAG, "Received BYE - Call terminated by remote")
@@ -452,13 +474,101 @@ class McpttSipStack {
                 _callState.value = CallSessionState.IDLE
                 _floorState.value = FloorState.IDLE
                 _activeSpeaker.value = null
+                _negotiatedMedia.value = null
+                pendingFloorRequest = false
                 resetDialogState()
             }
             "MESSAGE" -> {
                 Log.i(TAG, "Received SIP MESSAGE from ${msg.from}: ${msg.body}")
                 sendResponse(200, "OK", msg)
+                val sender = msg.from.substringAfter("sip:").substringBefore("@").ifBlank { msg.from }
+                val chat = IncomingChatMessage(
+                    from = sender,
+                    text = msg.body.trim()
+                )
+                _incomingMessages.value = _incomingMessages.value + chat
             }
         }
+    }
+
+    private fun applyFloorFromBody(msg: SipMessage) {
+        val speaker = extractSpeakerFromInfo(msg.body)
+        when (msg.floorControlState) {
+            "GRANTED" -> {
+                val isSelf = isSpeakerSelf(speaker)
+                if (isSelf || (_floorState.value == FloorState.REQUESTING && speaker == null)) {
+                    _floorState.value = FloorState.GRANTED
+                    _activeSpeaker.value = profile.displayName.ifBlank { profile.mcpttId }
+                    onFloorGranted?.invoke()
+                    Log.i(TAG, "Floor GRANTED to self")
+                } else {
+                    _floorState.value = FloorState.LISTENING
+                    _activeSpeaker.value = formatSpeakerDisplay(speaker) ?: "Remote User"
+                    Log.i(TAG, "Floor GRANTED to remote user: ${_activeSpeaker.value}")
+                }
+            }
+            "TAKEN" -> {
+                val formattedSpeaker = formatSpeakerDisplay(speaker) ?: "Remote User"
+                if (_floorState.value == FloorState.REQUESTING) {
+                    Log.w(TAG, "Floor request denied: floor taken by $formattedSpeaker")
+                    triggerFloorBusy()
+                    _floorState.value = FloorState.LISTENING
+                    _activeSpeaker.value = formattedSpeaker
+                } else if (_floorState.value != FloorState.GRANTED) {
+                    _floorState.value = FloorState.LISTENING
+                    _activeSpeaker.value = formattedSpeaker
+                    Log.i(TAG, "Floor TAKEN by ${_activeSpeaker.value} (now LISTENING)")
+                }
+            }
+            "DENIED" -> {
+                Log.w(TAG, "Floor request explicitly DENIED")
+                triggerFloorBusy()
+                _floorState.value = if (_activeSpeaker.value != null) FloorState.LISTENING else FloorState.IDLE
+            }
+            "IDLE", "RELEASE" -> {
+                _floorState.value = FloorState.IDLE
+                _activeSpeaker.value = null
+                Log.i(TAG, "Floor returned to IDLE")
+            }
+        }
+    }
+
+    private fun applySdpAnswer(sdpBody: String) {
+        var text = sdpBody
+        val v0 = text.indexOf("v=0")
+        if (v0 > 0) {
+            text = text.substring(v0)
+        }
+        if (text.isBlank() || !text.contains("m=audio")) return
+        var mediaIp: String? = null
+        var rtpPort: Int? = null
+        var rtcpPort: Int? = null
+
+        for (rawLine in text.lines()) {
+            val line = rawLine.trim()
+            when {
+                line.startsWith("c=IN IP4 ", ignoreCase = true) -> {
+                    mediaIp = line.substringAfter("c=IN IP4 ").trim().split(Regex("""\s+""")).firstOrNull()
+                }
+                line.startsWith("m=audio ", ignoreCase = true) -> {
+                    val parts = line.substringAfter("m=audio ").trim().split(Regex("""\s+"""))
+                    rtpPort = parts.firstOrNull()?.toIntOrNull()
+                }
+                line.startsWith("a=rtcp:", ignoreCase = true) -> {
+                    val portPart = line.substringAfter("a=rtcp:").trim().split(Regex("""\s+""")).firstOrNull()
+                    rtcpPort = portPart?.toIntOrNull()
+                }
+            }
+        }
+
+        val host = mediaIp ?: profile.pcscfHost
+        val port = rtpPort ?: profile.localRtpPort
+        val media = NegotiatedMedia(host, port, rtcpPort ?: (port + 1))
+        _negotiatedMedia.value = media
+        remoteMediaIp = host
+        remoteMediaPort = port
+        Log.i(TAG, "Negotiated media: $media")
+        onMediaNegotiated?.invoke(host, port)
     }
 
     fun register() {
@@ -590,15 +700,19 @@ class McpttSipStack {
             "Accept-Contact: *;+g.3gpp.mcptt;explicit;require\r\n"
         } else ""
 
+        val rtpPortToOffer = _localRtpPort.value
         val sdpBody = buildString {
             append("v=0\r\n")
-            append("o=${profile.imsi} 1000 1000 IN IP4 $localIp\r\n")
+            append("o=${profile.imsi} 10001 10001 IN IP4 $localIp\r\n")
             append("s=MCPTT Session\r\n")
             append("c=IN IP4 $localIp\r\n")
             append("t=0 0\r\n")
-            append("m=audio ${profile.localRtpPort} RTP/AVP 0\r\n")
+            append("m=audio $rtpPortToOffer RTP/AVP 0 8 101\r\n")
             append("a=rtpmap:0 PCMU/8000\r\n")
+            append("a=rtpmap:8 PCMA/8000\r\n")
+            append("a=rtpmap:101 telephone-event/8000\r\n")
             append("a=sendrecv\r\n")
+            append("a=mcptt\r\n")
         }
 
         val routeHeader = if (profile.scscfOrigRoute.isNotBlank()) {
@@ -618,6 +732,8 @@ class McpttSipStack {
             append("CSeq: $dialogCSeq INVITE\r\n")
             append("Contact: <sip:${profile.imsi}@$localIp:${profile.localSipPort}>$mcpttContactParam\r\n")
             append(acceptContact)
+            append("P-Preferred-Identity: <${profile.mcpttId}>\r\n")
+            append("P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=2089300000001\r\n")
             append("User-Agent: ${profile.userAgent}\r\n")
             append("Content-Type: application/sdp\r\n")
             append("Content-Length: ${sdpBody.toByteArray(Charsets.UTF_8).size}\r\n\r\n")
@@ -655,15 +771,19 @@ class McpttSipStack {
 
     private fun send200OkForInvite(inviteMsg: SipMessage) {
         val localIp = getLocalIpAddress()
+        val rtpPortToOffer = _localRtpPort.value
         val sdpBody = buildString {
             append("v=0\r\n")
             append("o=${profile.imsi} 2000 2000 IN IP4 $localIp\r\n")
             append("s=MCPTT Session\r\n")
             append("c=IN IP4 $localIp\r\n")
             append("t=0 0\r\n")
-            append("m=audio ${profile.localRtpPort} RTP/AVP 0\r\n")
+            append("m=audio $rtpPortToOffer RTP/AVP 0 8 101\r\n")
             append("a=rtpmap:0 PCMU/8000\r\n")
+            append("a=rtpmap:8 PCMA/8000\r\n")
+            append("a=rtpmap:101 telephone-event/8000\r\n")
             append("a=sendrecv\r\n")
+            append("a=mcptt\r\n")
         }
 
         val mcpttContactParam = if (profile.includeMcpttTags) ";+g.3gpp.mcptt" else ""
@@ -691,17 +811,42 @@ class McpttSipStack {
     }
 
     fun requestFloor() {
+        if (_floorState.value == FloorState.REQUESTING ||
+            _floorState.value == FloorState.GRANTED ||
+            _floorState.value == FloorState.RELEASING) {
+            Log.w(TAG, "requestFloor ignored: already in state ${_floorState.value}")
+            return
+        }
+        if (_floorState.value == FloorState.LISTENING) {
+            Log.w(TAG, "requestFloor rejected: floor is currently held by ${_activeSpeaker.value}")
+            triggerFloorBusy()
+            return
+        }
+
         _floorState.value = FloorState.REQUESTING
-        sendInDialogFloorAction("floor-request")
+        _activeSpeaker.value = profile.displayName.ifBlank { profile.mcpttId }
+
+        if (_callState.value != CallSessionState.CONNECTED) {
+            pendingFloorRequest = true
+            initiateMcpttCall()
+            return
+        }
+
+        sendFloorControlMessage("floor-request")
     }
 
     fun releaseFloor() {
+        pendingFloorRequest = false
+        val wasTransmitting = _floorState.value == FloorState.GRANTED || _floorState.value == FloorState.REQUESTING
+        _floorState.value = FloorState.RELEASING
+        if (_callState.value == CallSessionState.CONNECTED && wasTransmitting) {
+            sendFloorControlMessage("floor-release")
+        }
         _floorState.value = FloorState.IDLE
         _activeSpeaker.value = null
-        sendInDialogFloorAction("floor-release")
     }
 
-    private fun sendInDialogFloorAction(actionName: String) {
+    fun sendFloorControlMessage(action: String) {
         val callId = activeCallId ?: return
         val localIp = getLocalIpAddress()
         val branch = "z9hG4bK-" + UUID.randomUUID().toString().take(12)
@@ -709,8 +854,9 @@ class McpttSipStack {
         dialogCSeq++
 
         val routeHeaders = buildRouteHeader(activeRouteSet)
-        val body = "Action=$actionName\r\n"
+        val body = "Action=$action\r\n"
         val bodyBytes = body.toByteArray(Charsets.UTF_8)
+        val toTag = activeCallToTag
 
         val sipPacket = buildString {
             append("INFO $targetUri SIP/2.0\r\n")
@@ -720,9 +866,12 @@ class McpttSipStack {
                 append(routeHeaders)
             }
             append("From: <${profile.mcpttId}>;tag=$activeCallFromTag\r\n")
-            append("To: <${profile.targetGroup}>;tag=${activeCallToTag ?: ""}\r\n")
+            append("To: <${profile.targetGroup}>${if (!toTag.isNullOrEmpty()) ";tag=$toTag" else ""}\r\n")
             append("Call-ID: $callId\r\n")
             append("CSeq: $dialogCSeq INFO\r\n")
+            append("Contact: <sip:${profile.imsi}@$localIp:${profile.localSipPort}>${if (profile.includeMcpttTags) ";+g.3gpp.mcptt" else ""}\r\n")
+            append("Accept-Contact: *;+g.3gpp.mcptt;explicit;require\r\n")
+            append("P-Preferred-Identity: <${profile.mcpttId}>\r\n")
             append("User-Agent: ${profile.userAgent}\r\n")
             append("Content-Type: text/plain\r\n")
             append("Content-Length: ${bodyBytes.size}\r\n\r\n")
@@ -732,9 +881,23 @@ class McpttSipStack {
         sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
     }
 
+    fun sendInDialogFloorAction(actionName: String) {
+        sendFloorControlMessage(actionName)
+    }
+
     fun endCall() {
+        pendingFloorRequest = false
         val callId = activeCallId ?: return
         _callState.value = CallSessionState.DISCONNECTING
+
+        if (_floorState.value == FloorState.GRANTED || _floorState.value == FloorState.REQUESTING) {
+            try {
+                sendFloorControlMessage("floor-release")
+            } catch (e: Exception) {
+                Log.w(TAG, "Best effort floor release on endCall failed: ${e.message}")
+            }
+        }
+
         val localIp = getLocalIpAddress()
         val branch = "z9hG4bK-" + UUID.randomUUID().toString().take(12)
         val targetUri = activeRemoteTargetUri ?: profile.targetGroup
@@ -750,7 +913,7 @@ class McpttSipStack {
                 append(routeHeaders)
             }
             append("From: <${profile.mcpttId}>;tag=$activeCallFromTag\r\n")
-            append("To: <${profile.targetGroup}>;tag=${activeCallToTag ?: ""}\r\n")
+            append("To: <${profile.targetGroup}>${if (!activeCallToTag.isNullOrEmpty()) ";tag=$activeCallToTag" else ""}\r\n")
             append("Call-ID: $callId\r\n")
             append("CSeq: $dialogCSeq BYE\r\n")
             append("User-Agent: ${profile.userAgent}\r\n")
@@ -761,6 +924,7 @@ class McpttSipStack {
         _callState.value = CallSessionState.IDLE
         _floorState.value = FloorState.IDLE
         _activeSpeaker.value = null
+        _negotiatedMedia.value = null
         resetDialogState()
     }
 
@@ -967,6 +1131,8 @@ class McpttSipStack {
         activeRouteSet = emptyList()
         remoteMediaIp = null
         remoteMediaPort = null
+        _negotiatedMedia.value = null
+        pendingFloorRequest = false
     }
 
     private fun generateTag(): String = UUID.randomUUID().toString().take(8)
@@ -984,11 +1150,31 @@ class McpttSipStack {
 
     private fun extractSpeakerFromInfo(body: String): String? {
         for (line in body.lines()) {
-            if (line.trim().startsWith("speaker=", ignoreCase = true)) {
-                return line.substringAfter("=").trim()
+            val trimmed = line.trim()
+            if (trimmed.startsWith("speaker=", ignoreCase = true)) {
+                return trimmed.substringAfter("=").trim()
+            }
+            if (trimmed.startsWith("user=", ignoreCase = true)) {
+                return trimmed.substringAfter("=").trim()
             }
         }
         return null
+    }
+
+    private fun isSpeakerSelf(speaker: String?): Boolean {
+        if (speaker.isNullOrBlank()) return false
+        val clean = speaker.trim().removeSurrounding("<", ">")
+        val user = clean.substringAfter("sip:").substringBefore("@")
+        val myUser = profile.imsi.substringAfter("sip:").substringBefore("@")
+        val myMcptt = profile.mcpttId.substringAfter("sip:").substringBefore("@")
+        return user == myUser || user == myMcptt || clean == profile.mcpttId || clean == profile.imsi
+    }
+
+    private fun formatSpeakerDisplay(speaker: String?): String? {
+        if (speaker.isNullOrBlank()) return null
+        val clean = speaker.trim().removeSurrounding("<", ">")
+        val user = clean.substringAfter("sip:").substringBefore("@")
+        return user.ifBlank { clean }
     }
 
     private fun md5Hex(input: String): String {

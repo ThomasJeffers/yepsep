@@ -54,6 +54,16 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onStop() {
+        super.onStop()
+        viewModel.onAppBackgrounded()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.onAppResumed()
+    }
 }
 
 data class NavItem(val label: String, val icon: ImageVector, val tag: String)

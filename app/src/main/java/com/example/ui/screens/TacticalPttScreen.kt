@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.MicNone
 import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.AlertDialog
@@ -97,9 +98,14 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
     val callState by viewModel.callState.collectAsState()
     val floorState by viewModel.floorState.collectAsState()
     val activeSpeaker by viewModel.activeSpeaker.collectAsState()
+    val floorBusy by viewModel.floorBusy.collectAsState()
     val profile by viewModel.sipProfile.collectAsState()
     val audioLevel by viewModel.micAudioLevel.collectAsState()
     val networkStatus by viewModel.apnNetworkStatus.collectAsState()
+    val negotiatedMedia by viewModel.negotiatedMedia.collectAsState()
+    val rtpTxCount by viewModel.rtpTxCount.collectAsState()
+    val rtpRxCount by viewModel.rtpRxCount.collectAsState()
+    val boundRtpPort by viewModel.boundRtpPort.collectAsState()
 
     var isPttHeld by remember { mutableStateOf(false) }
     var quickMsgText by remember { mutableStateOf("") }
@@ -133,9 +139,11 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
     val pttColor by animateColorAsState(
         targetValue = when {
             !isRegistered -> Color(0xFF64748B)
+            floorBusy -> HighDensityEmergency
             floorState == FloorState.GRANTED -> HighDensitySecondary
             floorState == FloorState.REQUESTING -> HighDensityWarning
-            floorState == FloorState.TAKEN -> Color.Gray
+            floorState == FloorState.LISTENING -> Color(0xFF475569)
+            floorState == FloorState.RELEASING -> Color(0xFF64748B)
             else -> if (isPttHeld) HighDensityPttRedDark else HighDensityPttRed
         },
         label = "pttColor"
@@ -389,6 +397,16 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                         color = HighDensityNavy,
                         fontFamily = FontFamily.Monospace
                     )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = if (negotiatedMedia != null)
+                            "RTP: ${negotiatedMedia?.host}:${negotiatedMedia?.rtpPort} | TX: $rtpTxCount RX: $rtpRxCount"
+                        else
+                            "RTP Port: $boundRtpPort (Idle) | TX: $rtpTxCount RX: $rtpRxCount",
+                        fontSize = 9.sp,
+                        color = HighDensityTextSecondary,
+                        fontFamily = FontFamily.Monospace
+                    )
                 }
 
                 Box(
@@ -418,19 +436,21 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
-                containerColor = when (floorState) {
-                    FloorState.GRANTED -> HighDensitySecondary.copy(alpha = 0.15f)
-                    FloorState.REQUESTING -> HighDensityWarning.copy(alpha = 0.15f)
-                    FloorState.TAKEN -> HighDensityEmergency.copy(alpha = 0.15f)
+                containerColor = when {
+                    floorBusy -> HighDensityEmergency.copy(alpha = 0.20f)
+                    floorState == FloorState.GRANTED -> HighDensitySecondary.copy(alpha = 0.15f)
+                    floorState == FloorState.REQUESTING -> HighDensityWarning.copy(alpha = 0.15f)
+                    floorState == FloorState.LISTENING -> Color(0xFF334155).copy(alpha = 0.5f)
                     else -> HighDensitySurface
                 }
             ),
             border = androidx.compose.foundation.BorderStroke(
                 1.dp,
-                when (floorState) {
-                    FloorState.GRANTED -> HighDensitySecondary
-                    FloorState.REQUESTING -> HighDensityWarning
-                    FloorState.TAKEN -> HighDensityEmergency
+                when {
+                    floorBusy -> HighDensityEmergency
+                    floorState == FloorState.GRANTED -> HighDensitySecondary
+                    floorState == FloorState.REQUESTING -> HighDensityWarning
+                    floorState == FloorState.LISTENING -> Color(0xFF64748B)
                     else -> HighDensityBorder
                 }
             ),
@@ -443,18 +463,22 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = when (floorState) {
-                        FloorState.GRANTED -> "● FLOOR GRANTED - TRANSMITTING AUDIO"
-                        FloorState.REQUESTING -> "▲ REQUESTING FLOOR (INFO)..."
-                        FloorState.TAKEN -> "■ FLOOR TAKEN BY REMOTE"
-                        else -> "Floor Idle / Ready to Transmit"
+                    text = when {
+                        floorBusy -> "⚠ FLOOR BUSY - REQUEST DENIED"
+                        floorState == FloorState.GRANTED -> "● FLOOR GRANTED - TRANSMITTING AUDIO"
+                        floorState == FloorState.REQUESTING -> "▲ REQUESTING FLOOR (INFO)..."
+                        floorState == FloorState.LISTENING -> "■ LISTENING - ${activeSpeaker?.let { "$it IS " } ?: "REMOTE "}SPEAKING"
+                        floorState == FloorState.RELEASING -> "▼ RELEASING FLOOR..."
+                        callState == CallSessionState.CONNECTED -> "Floor Idle / Ready to Transmit"
+                        else -> "Call Session Idle"
                     },
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold,
-                    color = when (floorState) {
-                        FloorState.GRANTED -> HighDensitySecondary
-                        FloorState.REQUESTING -> HighDensityWarning
-                        FloorState.TAKEN -> HighDensityEmergency
+                    color = when {
+                        floorBusy -> HighDensityEmergency
+                        floorState == FloorState.GRANTED -> HighDensitySecondary
+                        floorState == FloorState.REQUESTING -> HighDensityWarning
+                        floorState == FloorState.LISTENING -> Color(0xFF94A3B8)
                         else -> HighDensityTextSecondary
                     },
                     fontFamily = FontFamily.Monospace
@@ -463,7 +487,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 if (activeSpeaker != null) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Speaker: $activeSpeaker",
+                        text = if (floorState == FloorState.GRANTED) "Transmitting: $activeSpeaker" else "Active Speaker: $activeSpeaker",
                         fontSize = 11.sp,
                         color = HighDensityTextPrimary,
                         fontWeight = FontWeight.Bold
@@ -480,6 +504,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
         Spacer(modifier = Modifier.height(20.dp))
 
         // GIANT PTT BUTTON
+        val canHoldPtt = isRegistered && floorState != FloorState.LISTENING && !floorBusy
         Box(
             modifier = Modifier
                 .size(180.dp)
@@ -488,8 +513,8 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 .background(pttColor)
                 .border(8.dp, HighDensitySurface, CircleShape)
                 .testTag("ptt_button")
-                .pointerInput(isRegistered) {
-                    if (isRegistered) {
+                .pointerInput(isRegistered, floorState, floorBusy) {
+                    if (canHoldPtt) {
                         detectTapGestures(
                             onPress = {
                                 isPttHeld = true
@@ -497,6 +522,12 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                                 tryAwaitRelease()
                                 isPttHeld = false
                                 viewModel.onPttReleased()
+                            }
+                        )
+                    } else if (isRegistered) {
+                        detectTapGestures(
+                            onTap = {
+                                viewModel.onPttPressed()
                             }
                         )
                     }
@@ -507,6 +538,10 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 Icon(
                     imageVector = when {
                         !isRegistered -> Icons.Default.MicNone
+                        floorBusy -> Icons.Default.Warning
+                        floorState == FloorState.LISTENING -> Icons.Default.VolumeUp
+                        floorState == FloorState.GRANTED -> Icons.Default.Mic
+                        floorState == FloorState.REQUESTING -> Icons.Default.CellTower
                         isPttHeld -> Icons.Default.Mic
                         else -> Icons.Default.MicNone
                     },
@@ -518,9 +553,12 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 Text(
                     text = when {
                         !isRegistered -> "NOT REGISTERED"
+                        floorBusy -> "BUSY"
                         floorState == FloorState.GRANTED -> "SPEAK NOW"
                         floorState == FloorState.REQUESTING -> "WAIT..."
-                        floorState == FloorState.TAKEN -> "BUSY"
+                        floorState == FloorState.LISTENING -> "LISTENING"
+                        floorState == FloorState.RELEASING -> "RELEASING"
+                        callState != CallSessionState.CONNECTED -> "START CALL"
                         else -> "PUSH TO TALK"
                     },
                     fontSize = 14.sp,
