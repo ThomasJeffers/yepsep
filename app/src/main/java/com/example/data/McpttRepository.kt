@@ -26,8 +26,9 @@ class McpttRepository(context: Context) {
             mcpttId = prefs.getString("mcptt_id", "sip:901700000052769@ims.mnc070.mcc901.3gppnetwork.org") ?: "sip:901700000052769@ims.mnc070.mcc901.3gppnetwork.org",
             realm = prefs.getString("realm", "ims.mnc070.mcc901.3gppnetwork.org") ?: "ims.mnc070.mcc901.3gppnetwork.org",
             password = prefs.getString("password", "password123") ?: "password123",
-            pcscfHost = prefs.getString("pcscf_host", "172.22.0.21") ?: "172.22.0.21",
+            pcscfHost = prefs.getString("pcscf_host", "172.30.104.240") ?: "172.30.104.240",
             pcscfPort = prefs.getInt("pcscf_port", 5060),
+            pcscfFqdn = prefs.getString("pcscf_fqdn", "") ?: "",
             scscfOrigRoute = prefs.getString("scscf_orig_route", "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:6060;lr") ?: "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:6060;lr",
             asFallbackUri = prefs.getString("as_fallback_uri", "sip:172.30.104.240:5070;transport=udp") ?: "sip:172.30.104.240:5070;transport=udp",
             userAgent = prefs.getString("user_agent", "MCPTT-Exp5-UAC") ?: "MCPTT-Exp5-UAC",
@@ -53,6 +54,7 @@ class McpttRepository(context: Context) {
             putString("password", profile.password)
             putString("pcscf_host", profile.pcscfHost)
             putInt("pcscf_port", profile.pcscfPort)
+            putString("pcscf_fqdn", profile.pcscfFqdn)
             putString("scscf_orig_route", profile.scscfOrigRoute)
             putString("as_fallback_uri", profile.asFallbackUri)
             putString("user_agent", profile.userAgent)

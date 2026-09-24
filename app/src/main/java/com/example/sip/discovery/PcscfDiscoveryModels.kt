@@ -1,54 +1,63 @@
 package com.example.sip.discovery
 
 /**
- * 3GPP TS 24.229 & TS 23.228 P-CSCF Discovery Sources.
+ * 3GPP TS 24.229 & TS 23.228 P-CSCF Acquisition and Discovery Sources.
  * Explicitly distinguishes standards-defined sources and indicates availability
  * to a standard non-carrier Android application.
  */
 enum class PcscfDiscoverySource(
     val displayName: String,
     val isAvailableToStandardApp: Boolean,
+    val isImplemented: Boolean,
     val description: String
 ) {
     STATIC_LEGACY(
         displayName = "Static Fallback",
         isAvailableToStandardApp = true,
+        isImplemented = true,
         description = "Configured legacy static P-CSCF address used for backward-compatible fallback"
     ),
     DNS_A_AAAA(
         displayName = "Cellular DNS (A/AAAA)",
         isAvailableToStandardApp = true,
-        description = "Standard 3GPP P-CSCF FQDN resolution over the bound MCPTT cellular network"
+        isImplemented = true,
+        description = "A/AAAA resolution of an explicitly supplied/known P-CSCF FQDN over the bound MCPTT cellular network"
     ),
     DNS_SRV(
         displayName = "Cellular DNS (SRV)",
-        isAvailableToStandardApp = true,
-        description = "RFC 3263 SIP server resolution over the bound MCPTT cellular network"
+        isAvailableToStandardApp = false,
+        isImplemented = false,
+        description = "RFC 3263 SIP server resolution over cellular DNS (Not currently implemented in this build; marked future/unsupported)"
     ),
     DHCP_OPTION_120(
         displayName = "DHCPv4/v6 Option 120",
         isAvailableToStandardApp = false,
-        description = "RFC 3361/3319 DHCP SIP servers. NOT_AVAILABLE_TO_THIS_APP (Android framework restricts raw cellular DHCP options)"
+        isImplemented = false,
+        description = "RFC 3361/3319 DHCP SIP servers. NOT_AVAILABLE_TO_THIS_APP (Android framework restricts raw cellular DHCP options to standard APKs)"
     ),
     PCO_PROVISIONED(
         displayName = "3GPP NAS PCO",
         isAvailableToStandardApp = false,
+        isImplemented = false,
         description = "TS 24.008 Protocol Configuration Options from Attach/PDN. NOT_AVAILABLE_TO_THIS_APP (Requires carrier privileges)"
     ),
     ISIM_EF_PCSCF(
         displayName = "UICC ISIM EF_PCSCF",
         isAvailableToStandardApp = false,
+        isImplemented = false,
         description = "3GPP TS 31.103 ISIM Elementary File 0x6F09. NOT_AVAILABLE_TO_THIS_APP (Requires READ_PRIVILEGED_PHONE_STATE)"
     ),
     MANUAL_OVERRIDE(
         displayName = "Manual Override",
         isAvailableToStandardApp = true,
+        isImplemented = true,
         description = "Explicit test injection or operator manual override"
     )
 }
 
 /**
  * Represents an individual P-CSCF destination candidate.
+ * Formats host correctly according to RFC 3986 / RFC 3261 (e.g. [2001:db8::1] for IPv6).
  */
 data class PcscfEndpoint(
     val host: String,
@@ -59,12 +68,34 @@ data class PcscfEndpoint(
     val weight: Int = 0,
     val isIpv6: Boolean = host.contains(":")
 ) {
-    fun toSipUri(): String = "sip:$host:$port;transport=${transport.lowercase()}"
-    fun toHostPort(): String = "$host:$port"
+    /**
+     * Returns the host string formatted safely for URIs.
+     * If the host is an IPv6 literal and not already enclosed in brackets, encloses it in brackets.
+     */
+    fun formattedHostForUri(): String {
+        return if (isIpv6) {
+            val clean = host.trim()
+            if (clean.startsWith("[") && clean.endsWith("]")) clean else "[$clean]"
+        } else {
+            host.trim()
+        }
+    }
+
+    /**
+     * Generates a valid SIP URI with IPv6 bracket safety.
+     * E.g. sip:[2001:db8::1]:5060;transport=udp
+     */
+    fun toSipUri(): String = "sip:${formattedHostForUri()}:$port;transport=${transport.lowercase()}"
+
+    /**
+     * Generates host:port representation with IPv6 bracket safety.
+     * E.g. [2001:db8::1]:5060 or 172.30.104.240:5060
+     */
+    fun toHostPort(): String = "${formattedHostForUri()}:$port"
 }
 
 /**
- * Authoritative runtime object representing the active P-CSCF selected by the discovery engine.
+ * Authoritative runtime object representing the active P-CSCF selected by the acquisition engine.
  */
 data class SelectedPcscf(
     val endpoint: PcscfEndpoint,
@@ -86,7 +117,7 @@ data class SelectedPcscf(
 }
 
 /**
- * Lifecycle states for P-CSCF discovery.
+ * Lifecycle states for P-CSCF acquisition/discovery.
  */
 sealed class PcscfDiscoveryState {
     object Idle : PcscfDiscoveryState() {

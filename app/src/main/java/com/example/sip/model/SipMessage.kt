@@ -1,8 +1,10 @@
 package com.example.sip.model
 
+data class SipHeader(val name: String, val value: String)
+
 data class SipMessage(
-    val rawText: String,
-    val isResponse: Boolean,
+    val rawText: String = "",
+    val isResponse: Boolean = false,
     val method: String = "", // e.g. "INVITE", "REGISTER", "MESSAGE", "INFO", "ACK", "BYE"
     val statusCode: Int = 0, // e.g. 200, 401, 180
     val statusText: String = "", // e.g. "OK", "Unauthorized"
@@ -58,77 +60,87 @@ data class SipMessage(
     fun getHeaders(name: String): List<String> = multiHeaders[name.lowercase().trim()] ?: emptyList()
 
     /**
-     * Extracts Record-Route URIs in reverse order (P-CSCF first), as required by RFC 3261 UAC route sets.
-     * Preserves parameters such as ;lr needed for SIP proxy loose routing.
+     * Extracts Contact URI from SIP message Contact header.
+     * RFC 3261: Contact: <sip:user@host:port> -> sip:user@host:port
      */
-    fun extractUacRouteSet(): List<String> {
-        val rr = getHeaders("record-route")
-        val parsed = mutableListOf<String>()
-        for (item in rr) {
-            // Can be comma-separated or separate headers
-            val tokens = item.split(",")
-            for (token in tokens) {
-                val trimmed = token.trim()
-                if (trimmed.isNotEmpty()) {
-                    val uri = if (trimmed.contains("<") && trimmed.contains(">")) {
-                        trimmed.substringAfter("<").substringBefore(">")
-                    } else {
-                        trimmed
-                    }
-                    parsed.add(uri)
-                }
-            }
+    fun extractContactUri(): String {
+        val contactVal = getHeader("contact").ifEmpty { contact }
+        if (contactVal.isBlank()) return ""
+        val start = contactVal.indexOf('<')
+        val end = contactVal.indexOf('>')
+        return if (start != -1 && end > start) {
+            contactVal.substring(start + 1, end).trim()
+        } else {
+            contactVal.substringBefore(";").trim()
         }
-        return parsed.reversed()
     }
 
     /**
-     * Extracts connection IP and audio port from SDP body if present.
+     * Extracts RFC 3261 UAC route set from Record-Route headers.
+     * When receiving 200 OK to INVITE, the UAC builds the route set by reversing Record-Route.
      */
+    fun extractUacRouteSet(): List<String> {
+        val rrHeaders = getHeaders("record-route")
+        if (rrHeaders.isEmpty()) {
+            val single = getHeader("record-route")
+            if (single.isBlank()) return emptyList()
+            // Split comma-separated Record-Route entries if present
+            return single.split(",").map { cleanRouteUri(it) }.reversed()
+        }
+        return rrHeaders.map { cleanRouteUri(it) }.reversed()
+    }
+
+    private fun cleanRouteUri(raw: String): String {
+        val start = raw.indexOf('<')
+        val end = raw.indexOf('>')
+        return if (start != -1 && end > start) {
+            raw.substring(start + 1, end).trim()
+        } else {
+            raw.trim()
+        }
+    }
+
     fun extractSdpMedia(): Pair<String?, Int?> {
-        var ip: String? = null
-        var port: Int? = null
-        for (line in body.lines()) {
+        var remoteIp: String? = null
+        var remotePort: Int? = null
+
+        val lines = body.lines()
+        for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.startsWith("c=IN IP4 ")) {
-                ip = trimmed.substring(9).trim().split(" ")[0]
+                val ip = trimmed.removePrefix("c=IN IP4 ").trim()
+                if (ip.isNotEmpty()) {
+                    remoteIp = ip
+                }
             } else if (trimmed.startsWith("m=audio ")) {
                 val parts = trimmed.split(" ")
                 if (parts.size >= 2) {
-                    port = parts[1].toIntOrNull()
+                    val port = parts[1].toIntOrNull()
+                    if (port != null && port > 0) {
+                        remotePort = port
+                    }
                 }
             }
         }
-        return Pair(ip, port)
-    }
-
-    /**
-     * Extracts the dialog contact URI (without angle brackets and parameter tags).
-     */
-    fun extractContactUri(): String {
-        val raw = getHeader("contact")
-        if (raw.isEmpty()) return ""
-        return if (raw.contains("<") && raw.contains(">")) {
-            raw.substringAfter("<").substringBefore(">")
-        } else {
-            raw.split(";")[0].trim()
-        }
+        return Pair(remoteIp, remotePort)
     }
 
     companion object {
         fun parse(rawText: String): SipMessage {
             val lines = rawText.lines()
-            if (lines.isEmpty()) return SipMessage(rawText, false)
+            if (lines.isEmpty()) {
+                return SipMessage(rawText = rawText, isResponse = false)
+            }
 
-            val startLine = lines[0].trim()
-            val isResponse = startLine.startsWith("SIP/2.0", ignoreCase = true)
+            val startLine = lines.first().trim()
+            val isResponse = startLine.startsWith("SIP/2.0 ", ignoreCase = true)
 
             var method = ""
             var statusCode = 0
             var statusText = ""
 
             if (isResponse) {
-                val parts = startLine.split(" ", limit = 3)
+                val parts = startLine.split(Regex("""\s+"""), limit = 3)
                 if (parts.size >= 2) {
                     statusCode = parts[1].toIntOrNull() ?: 0
                 }
@@ -136,7 +148,7 @@ data class SipMessage(
                     statusText = parts[2]
                 }
             } else {
-                val parts = startLine.split(" ")
+                val parts = startLine.split(Regex("""\s+"""), limit = 3)
                 if (parts.isNotEmpty()) {
                     method = parts[0].uppercase()
                 }
@@ -145,68 +157,48 @@ data class SipMessage(
             val singleHeaders = mutableMapOf<String, String>()
             val multiHeaders = mutableMapOf<String, MutableList<String>>()
 
-            // Locate header / body separator (CRLF CRLF or LF LF)
-            val (blankLineIndex, separatorLength) = when {
-                rawText.contains("\r\n\r\n") -> Pair(rawText.indexOf("\r\n\r\n"), 4)
-                rawText.contains("\n\n") -> Pair(rawText.indexOf("\n\n"), 2)
-                else -> Pair(-1, 0)
+            // Locate header / body separation (either \r\n\r\n or \n\n)
+            var separatorLength = 4
+            var blankLineIndex = rawText.indexOf("\r\n\r\n")
+            if (blankLineIndex == -1) {
+                blankLineIndex = rawText.indexOf("\n\n")
+                separatorLength = 2
             }
 
-            val headerText = if (blankLineIndex != -1) rawText.substring(0, blankLineIndex) else rawText
+            val headerText = if (blankLineIndex != -1) {
+                rawText.substring(0, blankLineIndex)
+            } else {
+                rawText
+            }
 
-            val rawHeaderLines = headerText.lines().map { it.trimEnd('\r') }
-            val unfoldedHeaderLines = mutableListOf<String>()
-
-            // RFC 3261 Section 7.3.1: Line unfolding
-            for (i in 1 until rawHeaderLines.size) {
-                val line = rawHeaderLines[i]
-                if (line.isEmpty()) continue
-                if (line.startsWith(" ") || line.startsWith("\t")) {
-                    if (unfoldedHeaderLines.isNotEmpty()) {
-                        val lastIdx = unfoldedHeaderLines.size - 1
-                        unfoldedHeaderLines[lastIdx] = unfoldedHeaderLines[lastIdx] + " " + line.trim()
-                    }
-                } else if (!line.contains(":") && unfoldedHeaderLines.isNotEmpty()) {
-                    // Proxies/servers wrapping authentication or parameters without leading whitespace
-                    val lastIdx = unfoldedHeaderLines.size - 1
-                    unfoldedHeaderLines[lastIdx] = unfoldedHeaderLines[lastIdx] + " " + line.trim()
-                } else {
-                    unfoldedHeaderLines.add(line.trim())
+            val headerLines = headerText.lines()
+            // Skip startLine
+            var i = 1
+            while (i < headerLines.size) {
+                var line = headerLines[i]
+                if (line.isBlank()) {
+                    i++
+                    continue
                 }
-            }
-
-            for (hLine in unfoldedHeaderLines) {
-                val colonIndex = hLine.indexOf(':')
-                if (colonIndex > 0) {
-                    val rawHeaderName = hLine.substring(0, colonIndex).trim().lowercase()
-                    val headerValue = hLine.substring(colonIndex + 1).trim()
-
-                    // Canonicalize compact SIP headers
-                    val headerName = when (rawHeaderName) {
-                        "v" -> "via"
-                        "f" -> "from"
-                        "t" -> "to"
-                        "m" -> "contact"
-                        "i" -> "call-id"
-                        "c" -> "content-type"
-                        "l" -> "content-length"
-                        else -> rawHeaderName
-                    }
-
-                    if (!singleHeaders.containsKey(headerName)) {
-                        singleHeaders[headerName] = headerValue
-                    }
-                    if (rawHeaderName != headerName && !singleHeaders.containsKey(rawHeaderName)) {
-                        singleHeaders[rawHeaderName] = headerValue
-                    }
-                    multiHeaders.getOrPut(headerName) { mutableListOf() }.add(headerValue)
-                    if (rawHeaderName != headerName) {
-                        multiHeaders.getOrPut(rawHeaderName) { mutableListOf() }.add(headerValue)
-                    }
+                // Check continuation / multiline headers
+                var fullLine = line.trim()
+                while (i + 1 < headerLines.size && (headerLines[i + 1].startsWith(" ") || headerLines[i + 1].startsWith("\t"))) {
+                    i++
+                    fullLine += " " + headerLines[i].trim()
                 }
+
+                val colonIdx = fullLine.indexOf(':')
+                if (colonIdx != -1) {
+                    val hName = fullLine.substring(0, colonIdx).trim().lowercase()
+                    val hVal = fullLine.substring(colonIdx + 1).trim()
+                    singleHeaders[hName] = hVal
+                    val list = multiHeaders.getOrPut(hName) { mutableListOf() }
+                    list.add(hVal)
+                }
+                i++
             }
 
-            // Extract body based on parsed Content-Length in UTF-8 octets
+            // Accurate byte-length body parsing adhering to Content-Length
             val declaredContentLength = singleHeaders["content-length"]?.trim()?.toIntOrNull()
             val body = if (blankLineIndex != -1) {
                 if (declaredContentLength != null && declaredContentLength <= 0) {

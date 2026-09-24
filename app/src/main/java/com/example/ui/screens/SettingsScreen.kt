@@ -71,6 +71,7 @@ fun SettingsScreen(viewModel: McpttViewModel) {
     var password by remember(currentProfile) { mutableStateOf(currentProfile.password) }
     var pcscfHost by remember(currentProfile) { mutableStateOf(currentProfile.pcscfHost) }
     var pcscfPort by remember(currentProfile) { mutableStateOf(currentProfile.pcscfPort.toString()) }
+    var pcscfFqdn by remember(currentProfile) { mutableStateOf(currentProfile.pcscfFqdn) }
     var mcpttAsHost by remember(currentProfile) { mutableStateOf(currentProfile.mcpttAsHost) }
     var mcpttAsPort by remember(currentProfile) { mutableStateOf(currentProfile.mcpttAsPort.toString()) }
     var userAgent by remember(currentProfile) { mutableStateOf(currentProfile.userAgent) }
@@ -221,20 +222,22 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         Spacer(modifier = Modifier.height(12.dp))
 
         // SECTION 2: SIP PROXY / P-CSCF
-        Text("2. P-CSCF ENDPOINT & FALLBACK CONFIGURATION", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-        Text("Used for direct connection or as legacy fallback if cellular DNS discovery returns no records.", fontSize = 10.sp, color = HighDensityTextSecondary)
+        Text("2. P-CSCF ENDPOINT & ACQUISITION CONFIGURATION", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+        Text("Proven static fallback (172.30.104.240:5060) is always used if no explicit FQDN is provided or if cellular DNS resolution fails.", fontSize = 10.sp, color = HighDensityTextSecondary)
         Spacer(modifier = Modifier.height(6.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Box(modifier = Modifier.weight(2f)) {
-                OutlinedField("Static Fallback Host/FQDN", pcscfHost) { pcscfHost = it }
+                OutlinedField("Legacy Fallback IP (Known-Good)", pcscfHost) { pcscfHost = it }
             }
             Box(modifier = Modifier.weight(1f)) {
                 OutlinedField("Port", pcscfPort) { pcscfPort = it }
             }
         }
+        Spacer(modifier = Modifier.height(6.dp))
+        OutlinedField("Explicit P-CSCF FQDN (Optional, e.g. pcscf.ims.net)", pcscfFqdn) { pcscfFqdn = it }
 
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -358,6 +361,7 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     password = password.trim(),
                     pcscfHost = pcscfHost.trim(),
                     pcscfPort = pcscfPort.toIntOrNull() ?: 5060,
+                    pcscfFqdn = pcscfFqdn.trim(),
                     mcpttAsHost = mcpttAsHost.trim(),
                     mcpttAsPort = mcpttAsPort.toIntOrNull() ?: 5060,
                     userAgent = userAgent.trim(),

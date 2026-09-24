@@ -1,6 +1,7 @@
 package com.example.sip.engine
 
 import android.content.Context
+import android.net.Network
 import android.util.Log
 import com.example.sip.discovery.DefaultPcscfDiscoveryProvider
 import com.example.sip.discovery.PcscfDiscoveryProvider
@@ -15,7 +16,7 @@ import com.example.sip.model.SipProfile
 import com.example.sip.model.SipTrafficLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,53 +30,25 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.security.MessageDigest
 import java.util.UUID
 
-enum class RegistrationState {
-    NETWORK_UNAVAILABLE,
-    MCPTT_APN_BOUND,
-    UNREGISTERED,
-    REGISTERING,
-    AUTHENTICATING,
-    REGISTERED,
-    REGISTRATION_FAILED;
+class McpttSipStack(
+    private val externalScope: CoroutineScope? = null
+) {
+    companion object {
+        private const val TAG = "McpttSipStack"
+    }
 
-    val isRegistered: Boolean get() = this == REGISTERED
-}
+    private val scope = externalScope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-enum class CallSessionState {
-    IDLE,
-    CALLING,
-    CONNECTED,
-    DISCONNECTING
-}
+    var profile: SipProfile = SipProfile()
+        private set
 
-enum class FloorState {
-    IDLE,
-    REQUESTING,
-    GRANTED,
-    RELEASING,
-    LISTENING
-}
-
-data class NegotiatedMedia(
-    val host: String,
-    val rtpPort: Int,
-    val rtcpPort: Int = rtpPort + 1
-)
-
-data class IncomingChatMessage(
-    val from: String,
-    val text: String,
-    val timestamp: Long = System.currentTimeMillis()
-)
-
-class McpttSipStack {
-    private val scope = CoroutineScope(Dispatchers.IO)
+    var apnManager: McpttApnNetworkManager? = null
+        private set
 
     private var sipSocket: DatagramSocket? = null
-    private var listenJob: Job? = null
+    private var listeningJob: kotlinx.coroutines.Job? = null
 
     private val _registrationState = MutableStateFlow(RegistrationState.UNREGISTERED)
     val registrationState: StateFlow<RegistrationState> = _registrationState.asStateFlow()
@@ -89,42 +62,46 @@ class McpttSipStack {
     private val _floorState = MutableStateFlow(FloorState.IDLE)
     val floorState: StateFlow<FloorState> = _floorState.asStateFlow()
 
+    private val _floorBusy = MutableStateFlow(false)
+    val floorBusy: StateFlow<Boolean> = _floorBusy.asStateFlow()
+
     private val _activeSpeaker = MutableStateFlow<String?>(null)
     val activeSpeaker: StateFlow<String?> = _activeSpeaker.asStateFlow()
 
-    private val _floorBusy = MutableStateFlow(false)
-    val floorBusy: StateFlow<Boolean> = _floorBusy.asStateFlow()
-    private var floorBusyJob: Job? = null
+    private val _trafficLogs = MutableSharedFlow<SipTrafficLog>(replay = 50)
+    val trafficLogs: SharedFlow<SipTrafficLog> = _trafficLogs.asSharedFlow()
 
-    fun triggerFloorBusy() {
-        _floorBusy.value = true
-        floorBusyJob?.cancel()
-        floorBusyJob = scope.launch {
-            delay(2500)
-            _floorBusy.value = false
-        }
-    }
+    // Dialog state for active MCPTT call / session
+    private var activeCallId: String? = null
+    private var activeCallFromTag: String? = null
+    private var activeCallToTag: String? = null
+    private var activeRemoteTargetUri: String? = null
+    private var activeRouteSet: List<String> = emptyList()
+    private var dialogCSeq: Int = 100
 
-    var profile = SipProfile()
-        private set
+    // Remote SDP audio endpoint
+    private var remoteMediaIp: String? = null
+    private var remoteMediaPort: Int? = null
 
-    var apnManager: McpttApnNetworkManager? = null
-        private set
+    // Registration transaction state
+    private var registerCallId: String = ""
+    private var registerFromTag: String = ""
+    private var registerCSeq: Int = 1
+    private var registerAuthAttempts = 0
 
-    // Client-side P-CSCF Discovery Abstraction
+    // P-CSCF Discovery provider abstraction
     val pcscfDiscoveryProvider: PcscfDiscoveryProvider = DefaultPcscfDiscoveryProvider()
     val selectedPcscf: StateFlow<SelectedPcscf?> = pcscfDiscoveryProvider.selectedPcscf
     val pcscfDiscoveryState: StateFlow<PcscfDiscoveryState> = pcscfDiscoveryProvider.discoveryState
 
     /**
-     * Resolves the authoritative P-CSCF host to send SIP traffic to.
-     * Uses the selected P-CSCF from discovery, or legacy fallback from profile if discovery has not run yet.
+     * Authoritative P-CSCF host for initial/out-of-dialog IMS requests.
      */
     val currentPcscfHost: String
         get() = selectedPcscf.value?.host ?: profile.pcscfHost
 
     /**
-     * Resolves the authoritative P-CSCF port to send SIP traffic to.
+     * Authoritative P-CSCF port for initial/out-of-dialog IMS requests.
      */
     val currentPcscfPort: Int
         get() = selectedPcscf.value?.port ?: profile.pcscfPort
@@ -144,39 +121,24 @@ class McpttSipStack {
 
     private var pendingFloorRequest = false
 
-    private val _trafficLogs = MutableSharedFlow<SipTrafficLog>(replay = 50)
-    val trafficLogs: SharedFlow<SipTrafficLog> = _trafficLogs.asSharedFlow()
-
-    // SIP Dialog and Session State
-    private var registerCallId = UUID.randomUUID().toString()
-    private var registerFromTag = generateTag()
-    private var registerCSeq = 1
-    private var registerAuthAttempts = 0
-    private var lastAuthNonce = ""
-    private var lastAuthRealm = ""
-    private var lastAuthQop = ""
-    private var lastAuthOpaque = ""
-
-    // Active Call Dialog State
-    private var activeCallId: String? = null
-    private var activeCallFromTag: String? = null
-    private var activeCallToTag: String? = null
-    private var activeRemoteTargetUri: String? = null
-    private var activeRouteSet: List<String> = emptyList()
-    private var dialogCSeq = 100
-
-    // Remote RTP Target
-    var remoteMediaIp: String? = null
-        private set
-    var remoteMediaPort: Int? = null
-        private set
-
-    var onMediaNegotiated: ((host: String, port: Int) -> Unit)? = null
+    var onMediaNegotiated: ((remoteIp: String, remotePort: Int) -> Unit)? = null
     var onFloorGranted: (() -> Unit)? = null
     var onPacketSent: ((rawSip: String, destHost: String, destPort: Int) -> Unit)? = null
 
     val currentSocket: DatagramSocket?
         get() = sipSocket
+
+    fun triggerFloorBusy() {
+        scope.launch {
+            _floorBusy.value = true
+            delay(1500)
+            _floorBusy.value = false
+        }
+    }
+
+    fun injectSimulatedPacket(rawSip: String) {
+        handleIncomingPacket(rawSip, profile.pcscfHost, profile.pcscfPort, sipSocket)
+    }
 
     fun start(context: Context, initialProfile: SipProfile) {
         this.profile = initialProfile
@@ -215,7 +177,7 @@ class McpttSipStack {
 
         netMgr.startMonitoring()
 
-        // Observe cellular APN network status to update socket binding and state without recreating transport
+        // Observe cellular APN network status to update socket binding and trigger acquisition
         scope.launch {
             netMgr.networkStatus.collect { netStatus ->
                 when (netStatus) {
@@ -233,7 +195,7 @@ class McpttSipStack {
                             }
                         }
 
-                        // Trigger P-CSCF discovery over the bound cellular network
+                        // Trigger P-CSCF acquisition over the bound cellular network
                         scope.launch {
                             val legacyFallback = PcscfEndpoint(
                                 host = profile.pcscfHost,
@@ -243,7 +205,7 @@ class McpttSipStack {
                             )
                             pcscfDiscoveryProvider.discover(
                                 network = netMgr.activeNetwork,
-                                realm = profile.realm,
+                                explicitPcscfFqdn = profile.pcscfFqdn.ifBlank { null },
                                 legacyFallback = legacyFallback
                             )
                         }
@@ -265,7 +227,8 @@ class McpttSipStack {
 
         if (initialProfile.autoRegister) {
             scope.launch {
-                delay(1500)
+                // Wait briefly for network / acquisition or proceed with fallback
+                delay(1200)
                 register()
             }
         }
@@ -285,7 +248,7 @@ class McpttSipStack {
             recreateSocket()
         }
 
-        // Re-run discovery with updated legacy fallback / realm
+        // Re-run acquisition with updated legacy fallback / FQDN
         scope.launch {
             val legacyFallback = PcscfEndpoint(
                 host = newProfile.pcscfHost,
@@ -295,85 +258,109 @@ class McpttSipStack {
             )
             pcscfDiscoveryProvider.discover(
                 network = apnManager?.activeNetwork,
-                realm = newProfile.realm,
+                explicitPcscfFqdn = newProfile.pcscfFqdn.ifBlank { null },
                 legacyFallback = legacyFallback
             )
         }
     }
 
+    fun setRegistrationStateForTest(state: RegistrationState) {
+        _registrationState.value = state
+    }
+
+    fun setCallStateForTest(state: CallSessionState) {
+        _callState.value = state
+    }
+
+    fun setFloorStateForTest(state: FloorState, speaker: String? = null) {
+        _floorState.value = state
+        _activeSpeaker.value = speaker
+    }
+
+    fun applyFloorFromBodyForTest(msg: SipMessage) {
+        applyFloorFromBody(msg)
+    }
+
     fun stop() {
-        listenJob?.cancel()
+        listeningJob?.cancel()
+        listeningJob = null
         try {
             sipSocket?.close()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing socket on stop: ${e.message}")
+        }
         sipSocket = null
         apnManager?.stopMonitoring()
     }
 
     @Synchronized
-    fun recreateSocket(): DatagramSocket {
-        listenJob?.cancel()
+    fun initSocket(): DatagramSocket {
+        if (sipSocket != null && !sipSocket!!.isClosed) {
+            return sipSocket!!
+        }
         try {
-            sipSocket?.close()
-        } catch (_: Exception) {}
-        sipSocket = null
-        return initSocket()
+            val port = profile.localSipPort
+            val socket = DatagramSocket(null)
+            socket.reuseAddress = true
+            socket.bind(InetSocketAddress(port))
+            sipSocket = socket
+
+            val sockId = System.identityHashCode(socket).toString(16)
+            Log.i(TAG, "SIP SOCKET CREATED id=$sockId localPort=$port")
+
+            apnManager?.activeNetwork?.let { net ->
+                try {
+                    net.bindSocket(socket)
+                    Log.i(TAG, "SIP SOCKET NETWORK BIND id=$sockId network=$net")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Initial network bind failed for socket id=$sockId: ${e.message}")
+                }
+            }
+
+            startListening(socket)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create/bind SIP DatagramSocket on port ${profile.localSipPort}: ${e.message}")
+            try {
+                val fallbackSocket = DatagramSocket()
+                sipSocket = fallbackSocket
+                val sockId = System.identityHashCode(fallbackSocket).toString(16)
+                Log.i(TAG, "SIP SOCKET CREATED (dynamic fallback) id=$sockId port=${fallbackSocket.localPort}")
+                apnManager?.activeNetwork?.let { net ->
+                    try {
+                        net.bindSocket(fallbackSocket)
+                        Log.i(TAG, "SIP SOCKET NETWORK BIND id=$sockId network=$net")
+                    } catch (be: Exception) {
+                        Log.w(TAG, "Network bind failed for dynamic socket id=$sockId: ${be.message}")
+                    }
+                }
+                startListening(fallbackSocket)
+            } catch (fe: Exception) {
+                Log.e(TAG, "Critical: Could not initialize SIP socket: ${fe.message}")
+                throw fe
+            }
+        }
+        return sipSocket!!
     }
 
     @Synchronized
-    fun initSocket(): DatagramSocket {
-        val existing = sipSocket
-        if (existing != null && !existing.isClosed && existing.localPort == profile.localSipPort) {
-            val sockId = System.identityHashCode(existing).toString(16)
-            apnManager?.activeNetwork?.let { net ->
-                try {
-                    net.bindSocket(existing)
-                    Log.i(TAG, "SIP SOCKET NETWORK BIND id=$sockId network=$net")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Could not bind existing socket id=$sockId to network $net: ${e.message}")
-                }
-            }
-            return existing
-        }
-
+    private fun recreateSocket() {
+        listeningJob?.cancel()
+        listeningJob = null
         try {
-            listenJob?.cancel()
-            existing?.close()
+            sipSocket?.close()
         } catch (e: Exception) {
-            Log.w(TAG, "Error closing previous socket: ${e.message}")
+            Log.w(TAG, "Error closing previous socket during recreate: ${e.message}")
         }
-
-        val socket = DatagramSocket(null).apply {
-            reuseAddress = true
-            broadcast = false
-        }
-        val sockId = System.identityHashCode(socket).toString(16)
-        Log.i(TAG, "SIP SOCKET CREATE id=$sockId")
-
-        socket.bind(InetSocketAddress(profile.localSipPort))
-        val localIp = socket.localAddress?.hostAddress ?: "0.0.0.0"
-        Log.i(TAG, "SIP SOCKET BIND id=$sockId local=$localIp:${socket.localPort}")
-
-        // Bind to active MCPTT network interface if available
-        apnManager?.activeNetwork?.let { net ->
-            try {
-                net.bindSocket(socket)
-                Log.i(TAG, "SIP SOCKET NETWORK BIND id=$sockId network=$net")
-            } catch (e: Exception) {
-                Log.w(TAG, "Could not bind socket id=$sockId to network $net: ${e.message}")
-            }
-        }
-
-        sipSocket = socket
-        startListening(socket)
-        return socket
+        sipSocket = null
+        initSocket()
     }
 
     private fun startListening(socket: DatagramSocket) {
-        listenJob?.cancel()
         val sockId = System.identityHashCode(socket).toString(16)
-        listenJob = scope.launch(Dispatchers.IO) {
-            val buffer = ByteArray(8192)
+        listeningJob?.cancel()
+        listeningJob = scope.launch(Dispatchers.IO) {
+            val buffer = ByteArray(65535)
+            Log.i(TAG, "SIP listener started on socket id=$sockId localPort=${socket.localPort}")
             while (isActive && !socket.isClosed) {
                 try {
                     val packet = DatagramPacket(buffer, buffer.size)
@@ -406,12 +393,13 @@ class McpttSipStack {
         val methodOrStatus = if (msg.isResponse) "${msg.statusCode} ${msg.statusText}".trim() else msg.method
         Log.i(TAG, "SIP RX parsed: id=$sockId method/status=$methodOrStatus Call-ID=${msg.callId} CSeq=${msg.cseq}")
 
-        logTraffic(rawSip, LogDirection.INBOUND, "$remoteHost:$remotePort")
+        val logType = determineLogType(msg)
+        logTraffic(rawSip, LogDirection.INBOUND, "$remoteHost:$remotePort", logType, methodOrStatus)
 
         if (msg.isResponse) {
             handleResponse(msg, sockId)
         } else {
-            handleRequest(msg)
+            handleRequest(msg, remoteHost, remotePort)
         }
     }
 
@@ -457,7 +445,7 @@ class McpttSipStack {
                         _callState.value = CallSessionState.CONNECTED
                         Log.i(TAG, "SIP INVITE ${msg.statusCode} ${msg.statusText} - Call established")
 
-                        // Extract dialog state
+                        // Extract RFC 3261 dialog state: remote target Contact URI and Route set
                         activeCallToTag = extractTag(msg.to)
                         activeRemoteTargetUri = msg.extractContactUri().ifEmpty {
                             profile.asFallbackUri.ifEmpty { profile.targetGroup }
@@ -467,7 +455,7 @@ class McpttSipStack {
                         // Extract SDP media information
                         applySdpAnswer(msg.body)
 
-                        // Send ACK
+                        // Send ACK following dialog state
                         sendAck(msg)
 
                         if (pendingFloorRequest) {
@@ -513,7 +501,7 @@ class McpttSipStack {
         }
     }
 
-    private fun handleRequest(msg: SipMessage) {
+    private fun handleRequest(msg: SipMessage, packetSourceHost: String, packetSourcePort: Int) {
         when (msg.method) {
             "INVITE" -> {
                 // Incoming call from AS / peer
@@ -526,17 +514,17 @@ class McpttSipStack {
                 activeRouteSet = msg.extractUacRouteSet()
 
                 applySdpAnswer(msg.body)
-                send200OkForInvite(msg)
+                send200OkForInvite(msg, packetSourceHost, packetSourcePort)
             }
             "INFO" -> {
                 // Floor Control Action from AS
                 Log.i(TAG, "Received in-dialog INFO: floorAction=${msg.floorControlState}, body=${msg.body}")
-                sendResponse(200, "OK", msg)
+                sendResponse(200, "OK", msg, packetSourceHost, packetSourcePort)
                 applyFloorFromBody(msg)
             }
             "BYE" -> {
                 Log.i(TAG, "Received BYE - Call terminated by remote")
-                sendResponse(200, "OK", msg)
+                sendResponse(200, "OK", msg, packetSourceHost, packetSourcePort)
                 _callState.value = CallSessionState.IDLE
                 _floorState.value = FloorState.IDLE
                 _activeSpeaker.value = null
@@ -546,7 +534,7 @@ class McpttSipStack {
             }
             "MESSAGE" -> {
                 Log.i(TAG, "Received SIP MESSAGE from ${msg.from}: ${msg.body}")
-                sendResponse(200, "OK", msg)
+                sendResponse(200, "OK", msg, packetSourceHost, packetSourcePort)
                 val sender = msg.from.substringAfter("sip:").substringBefore("@").ifBlank { msg.from }
                 val chat = IncomingChatMessage(
                     from = sender,
@@ -558,88 +546,44 @@ class McpttSipStack {
     }
 
     private fun applyFloorFromBody(msg: SipMessage) {
+        val state = msg.floorControlState
         val speaker = extractSpeakerFromInfo(msg.body)
-        when (msg.floorControlState) {
+        Log.i(TAG, "Applying floor state: state=$state speaker=$speaker")
+        when (state) {
             "GRANTED" -> {
-                val isSelf = isSpeakerSelf(speaker)
-                if (isSelf || (_floorState.value == FloorState.REQUESTING && speaker == null)) {
-                    _floorState.value = FloorState.GRANTED
-                    _activeSpeaker.value = profile.displayName.ifBlank { profile.mcpttId }
-                    onFloorGranted?.invoke()
-                    Log.i(TAG, "Floor GRANTED to self")
-                } else {
-                    _floorState.value = FloorState.LISTENING
-                    _activeSpeaker.value = formatSpeakerDisplay(speaker) ?: "Remote User"
-                    Log.i(TAG, "Floor GRANTED to remote user: ${_activeSpeaker.value}")
-                }
+                _floorState.value = FloorState.GRANTED
+                _activeSpeaker.value = profile.displayName
+                onFloorGranted?.invoke()
             }
             "TAKEN" -> {
-                val formattedSpeaker = formatSpeakerDisplay(speaker) ?: "Remote User"
-                val isSelf = isSpeakerSelf(speaker)
-                if (isSelf) {
-                    _floorState.value = FloorState.GRANTED
-                    _activeSpeaker.value = profile.displayName.ifBlank { profile.mcpttId }
-                    onFloorGranted?.invoke()
-                    Log.i(TAG, "Floor TAKEN confirmed for self (now GRANTED)")
-                } else {
-                    if (_floorState.value == FloorState.REQUESTING) {
-                        Log.w(TAG, "Floor request denied: floor taken by $formattedSpeaker")
-                        triggerFloorBusy()
-                    }
-                    _floorState.value = FloorState.LISTENING
-                    _activeSpeaker.value = formattedSpeaker
-                    Log.i(TAG, "Floor TAKEN by ${_activeSpeaker.value} (now LISTENING)")
-                }
-            }
-            "DENIED" -> {
-                Log.w(TAG, "Floor request explicitly DENIED")
-                triggerFloorBusy()
-                _floorState.value = if (_activeSpeaker.value != null) FloorState.LISTENING else FloorState.IDLE
+                _floorState.value = FloorState.LISTENING
+                _activeSpeaker.value = formatSpeakerDisplay(speaker) ?: "Remote Speaker"
             }
             "IDLE", "RELEASE" -> {
                 _floorState.value = FloorState.IDLE
                 _activeSpeaker.value = null
-                Log.i(TAG, "Floor returned to IDLE")
+            }
+            "DENIED" -> {
+                _floorState.value = FloorState.IDLE
+                _activeSpeaker.value = null
             }
         }
     }
 
-    private fun applySdpAnswer(sdpBody: String) {
-        var text = sdpBody
-        val v0 = text.indexOf("v=0")
-        if (v0 > 0) {
-            text = text.substring(v0)
-        }
-        if (text.isBlank() || !text.contains("m=audio")) return
-        var mediaIp: String? = null
-        var rtpPort: Int? = null
-        var rtcpPort: Int? = null
-
-        for (rawLine in text.lines()) {
-            val line = rawLine.trim()
-            when {
-                line.startsWith("c=IN IP4 ", ignoreCase = true) -> {
-                    mediaIp = line.substringAfter("c=IN IP4 ").trim().split(Regex("""\s+""")).firstOrNull()
-                }
-                line.startsWith("m=audio ", ignoreCase = true) -> {
-                    val parts = line.substringAfter("m=audio ").trim().split(Regex("""\s+"""))
-                    rtpPort = parts.firstOrNull()?.toIntOrNull()
-                }
-                line.startsWith("a=rtcp:", ignoreCase = true) -> {
-                    val portPart = line.substringAfter("a=rtcp:").trim().split(Regex("""\s+""")).firstOrNull()
-                    rtcpPort = portPart?.toIntOrNull()
-                }
-            }
-        }
-
-        val host = mediaIp ?: currentPcscfHost
-        val port = rtpPort ?: profile.localRtpPort
-        val media = NegotiatedMedia(host, port, rtcpPort ?: (port + 1))
+    private fun applySdpAnswer(sdp: String) {
+        val (ip, port) = SipMessage.parse(sdp).extractSdpMedia()
+        val host = ip ?: profile.mcpttAsHost
+        val rtpPort = port ?: profile.mcpttAsPort
+        val media = NegotiatedMedia(
+            host = host,
+            rtpPort = rtpPort,
+            codec = "PCMU/8000"
+        )
         _negotiatedMedia.value = media
         remoteMediaIp = host
         remoteMediaPort = port
         Log.i(TAG, "Negotiated media: $media")
-        onMediaNegotiated?.invoke(host, port)
+        onMediaNegotiated?.invoke(host, rtpPort)
     }
 
     fun register() {
@@ -650,16 +594,21 @@ class McpttSipStack {
         registerFromTag = "reg-" + UUID.randomUUID().toString().replace("-", "").take(8)
         registerCSeq = 1
 
-        Log.i(TAG, "REGISTER SEND via P-CSCF destination $currentPcscfHost:$currentPcscfPort:\n  callId=$registerCallId\n  cseq=$registerCSeq")
-        sendRegisterPacket(registerCSeq, authHeader = null)
+        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        Log.i(TAG, "REGISTER SEND via ${dest.description}:\n  callId=$registerCallId\n  cseq=$registerCSeq")
+        sendRegisterPacket(registerCSeq, authHeader = null, destination = dest)
     }
 
-    private fun sendRegisterPacket(cseq: Int, authHeader: String?) {
+    private fun sendRegisterPacket(cseq: Int, authHeader: String?, destination: SipDestination) {
         val sockId = sipSocket?.let { System.identityHashCode(it).toString(16) } ?: "unknown"
         if (!authHeader.isNullOrBlank()) {
-            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq authorization=true dest=$currentPcscfHost:$currentPcscfPort")
+            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq authorization=true dest=${destination.toHostPort()}")
         } else {
-            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq dest=$currentPcscfHost:$currentPcscfPort")
+            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq dest=${destination.toHostPort()}")
         }
 
         val localIp = getLocalIpAddress()
@@ -694,15 +643,13 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        sendRawSip(sipPacket, destination.host, destination.port, LogType.SIP_REGISTER, "REGISTER")
     }
 
     private fun handleRegister401(msg: SipMessage, sockId: String) {
-        val viaHeader = msg.getHeader("via")
-
         // Guard against repeated 401 infinite loop
         if (registerAuthAttempts >= 1) {
-            Log.e(TAG, "Registration failed: Repeated 401 challenge received after sending credentials. Stopping retry loop to prevent packet flood.")
+            Log.e(TAG, "Registration failed: Repeated 401 challenge received after sending credentials. Stopping retry loop.")
             _registrationState.value = RegistrationState.REGISTRATION_FAILED
             _registrationFailureReason.value = "Authentication failed: 401 Unauthorized (credentials rejected)"
             return
@@ -721,7 +668,6 @@ class McpttSipStack {
         val realm = SipAuthHelper.extractAuthParam(authHeader, "realm").ifEmpty { profile.realm }
         val nonce = SipAuthHelper.extractAuthParam(authHeader, "nonce")
         val rawQop = SipAuthHelper.extractAuthParam(authHeader, "qop")
-        val qop = SipAuthHelper.selectQop(rawQop).ifEmpty { "auth" }
         val opaque = SipAuthHelper.extractAuthParam(authHeader, "opaque")
 
         if (nonce.isEmpty()) {
@@ -733,7 +679,6 @@ class McpttSipStack {
 
         Log.i(TAG, "DIGEST AUTH id=$sockId realm=$realm noncePresent=${nonce.isNotBlank()}")
 
-        // Display AUTHENTICATING (401 MD5) in UI
         _registrationState.value = RegistrationState.AUTHENTICATING
 
         // RFC 3261: Increment CSeq for the authenticated REGISTER (1 -> 2)
@@ -746,16 +691,19 @@ class McpttSipStack {
             username = authUsername,
             realm = realm,
             password = profile.password,
-            method = "REGISTER",
-            uri = uri,
             nonce = nonce,
-            rawQop = qop,
-            opaque = opaque,
-            nc = "00000001"
+            uri = uri,
+            method = "REGISTER",
+            rawQop = rawQop,
+            opaque = opaque
         )
 
-        sendRegisterPacket(registerCSeq, authHeader = authHeaderValue)
-        _registrationState.value = RegistrationState.REGISTERING
+        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        sendRegisterPacket(registerCSeq, authHeaderValue, dest)
     }
 
     fun initiateMcpttCall(targetUri: String = profile.targetGroup) {
@@ -811,7 +759,13 @@ class McpttSipStack {
             append(sdpBody)
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // Initial INVITE is out-of-dialog: next-hop is P-CSCF
+        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_INVITE, "INVITE")
     }
 
     private fun sendAck(okMsg: SipMessage) {
@@ -837,10 +791,18 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // ACK is in-dialog: resolve next-hop via dialog route set or remote target URI
+        val dest = SipNextHopResolver.resolveInDialogDestination(
+            routeSet = activeRouteSet,
+            remoteTargetUri = activeRemoteTargetUri,
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_ACK, "ACK")
     }
 
-    private fun send200OkForInvite(inviteMsg: SipMessage) {
+    private fun send200OkForInvite(inviteMsg: SipMessage, packetSourceHost: String, packetSourcePort: Int) {
         val localIp = getLocalIpAddress()
         val rtpPortToOffer = _localRtpPort.value
         val sdpBody = buildString {
@@ -878,39 +840,40 @@ class McpttSipStack {
             append(sdpBody)
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // Response to INVITE: resolve via transaction top Via
+        val dest = SipNextHopResolver.resolveResponseDestination(
+            requestMsg = inviteMsg,
+            packetSourceHost = packetSourceHost,
+            packetSourcePort = packetSourcePort,
+            defaultPcscfHost = profile.pcscfHost,
+            defaultPcscfPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_RESPONSE, "200 OK")
     }
 
     fun requestFloor() {
         if (_floorState.value == FloorState.REQUESTING ||
             _floorState.value == FloorState.GRANTED ||
-            _floorState.value == FloorState.RELEASING) {
-            Log.w(TAG, "requestFloor ignored: already in state ${_floorState.value}")
-            return
-        }
-        if (_floorState.value == FloorState.LISTENING) {
-            Log.w(TAG, "requestFloor rejected: floor is currently held by ${_activeSpeaker.value}")
-            triggerFloorBusy()
+            _floorState.value == FloorState.RELEASING ||
+            _floorState.value == FloorState.LISTENING ||
+            _floorBusy.value) {
+            Log.w(TAG, "requestFloor ignored: invalid state ${_floorState.value}, busy=${_floorBusy.value}")
             return
         }
 
-        _floorState.value = FloorState.REQUESTING
-        _activeSpeaker.value = profile.displayName.ifBlank { profile.mcpttId }
-
-        if (_callState.value != CallSessionState.CONNECTED) {
+        if (_callState.value == CallSessionState.CONNECTED) {
+            _floorState.value = FloorState.REQUESTING
+            sendFloorControlMessage("floor-request")
+        } else {
+            // Not in session yet: initiate call and queue floor request
             pendingFloorRequest = true
             initiateMcpttCall()
-            return
         }
-
-        sendFloorControlMessage("floor-request")
     }
 
     fun releaseFloor() {
-        pendingFloorRequest = false
-        val wasTransmitting = _floorState.value == FloorState.GRANTED || _floorState.value == FloorState.REQUESTING
-        _floorState.value = FloorState.RELEASING
-        if (_callState.value == CallSessionState.CONNECTED && wasTransmitting) {
+        if (_floorState.value == FloorState.GRANTED || _floorState.value == FloorState.REQUESTING) {
+            _floorState.value = FloorState.RELEASING
             sendFloorControlMessage("floor-release")
         }
         _floorState.value = FloorState.IDLE
@@ -949,7 +912,15 @@ class McpttSipStack {
             append(body)
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // INFO is in-dialog: resolve next-hop via dialog route set or remote target URI
+        val dest = SipNextHopResolver.resolveInDialogDestination(
+            routeSet = activeRouteSet,
+            remoteTargetUri = activeRemoteTargetUri,
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_INFO, "INFO")
     }
 
     fun sendInDialogFloorAction(actionName: String) {
@@ -959,16 +930,6 @@ class McpttSipStack {
     fun endCall() {
         pendingFloorRequest = false
         val callId = activeCallId ?: return
-        _callState.value = CallSessionState.DISCONNECTING
-
-        if (_floorState.value == FloorState.GRANTED || _floorState.value == FloorState.REQUESTING) {
-            try {
-                sendFloorControlMessage("floor-release")
-            } catch (e: Exception) {
-                Log.w(TAG, "Best effort floor release on endCall failed: ${e.message}")
-            }
-        }
-
         val localIp = getLocalIpAddress()
         val branch = "z9hG4bK-" + UUID.randomUUID().toString().take(12)
         val targetUri = activeRemoteTargetUri ?: profile.targetGroup
@@ -991,7 +952,16 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // BYE is in-dialog: resolve next-hop via dialog route set or remote target URI
+        val dest = SipNextHopResolver.resolveInDialogDestination(
+            routeSet = activeRouteSet,
+            remoteTargetUri = activeRemoteTargetUri,
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_BYE, "BYE")
+
         _callState.value = CallSessionState.IDLE
         _floorState.value = FloorState.IDLE
         _activeSpeaker.value = null
@@ -1020,7 +990,13 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // Initial SUBSCRIBE is out-of-dialog: next-hop is P-CSCF
+        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_SUBSCRIBE, "SUBSCRIBE")
     }
 
     fun sendEmergencyAlert(customNote: String = "EMERGENCY SOS ALERT") {
@@ -1056,7 +1032,13 @@ class McpttSipStack {
             append(body)
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // Standalone MESSAGE is out-of-dialog: next-hop is P-CSCF
+        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_MESSAGE, "MESSAGE")
     }
 
     fun sendSipMessageText(targetUri: String, text: String) {
@@ -1080,10 +1062,22 @@ class McpttSipStack {
             append(text)
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // Standalone MESSAGE is out-of-dialog: next-hop is P-CSCF
+        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
+            selectedPcscf = selectedPcscf.value,
+            fallbackHost = profile.pcscfHost,
+            fallbackPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_MESSAGE, "MESSAGE")
     }
 
-    private fun sendResponse(code: Int, text: String, requestMsg: SipMessage) {
+    private fun sendResponse(
+        code: Int,
+        text: String,
+        requestMsg: SipMessage,
+        packetSourceHost: String,
+        packetSourcePort: Int
+    ) {
         val sipPacket = buildString {
             append("SIP/2.0 $code $text\r\n")
             for (v in requestMsg.getHeaders("via")) {
@@ -1098,10 +1092,24 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
+        // Responses MUST route via top Via / transaction origin, NOT blindly to P-CSCF
+        val dest = SipNextHopResolver.resolveResponseDestination(
+            requestMsg = requestMsg,
+            packetSourceHost = packetSourceHost,
+            packetSourcePort = packetSourcePort,
+            defaultPcscfHost = profile.pcscfHost,
+            defaultPcscfPort = profile.pcscfPort
+        )
+        sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_RESPONSE, "$code $text")
     }
 
-    private fun sendRawSip(rawSip: String, destHost: String, destPort: Int) {
+    private fun sendRawSip(
+        rawSip: String,
+        destHost: String,
+        destPort: Int,
+        logType: LogType = LogType.SYSTEM_EVENT,
+        methodOrResponse: String = ""
+    ) {
         onPacketSent?.invoke(rawSip, destHost, destPort)
 
         if (sipSocket == null || sipSocket?.isClosed == true) {
@@ -1114,64 +1122,66 @@ class McpttSipStack {
 
         val socket = sipSocket
         if (socket == null || socket.isClosed) {
-            Log.e(TAG, "Cannot send SIP: SIP socket unavailable")
+            Log.e(TAG, "Cannot send SIP message: sipSocket is null or closed")
             return
         }
-        val sockId = System.identityHashCode(socket).toString(16)
 
         scope.launch(Dispatchers.IO) {
             try {
+                val sockId = System.identityHashCode(socket).toString(16)
+                // Use cellular network resolution if bound, else standard InetAddress
+                val inetAddr = apnManager?.activeNetwork?.getByName(destHost) ?: InetAddress.getByName(destHost)
                 val bytes = rawSip.toByteArray(Charsets.UTF_8)
-                val targetAddr = InetAddress.getByName(destHost)
-                val packet = DatagramPacket(bytes, bytes.size, targetAddr, destPort)
+                val packet = DatagramPacket(bytes, bytes.size, inetAddr, destPort)
+
                 socket.send(packet)
-                logTraffic(rawSip, LogDirection.OUTBOUND, "$destHost:$destPort")
+                Log.i(TAG, "SIP TX id=$sockId bytes=${bytes.size} dest=$destHost:$destPort")
+                logTraffic(rawSip, LogDirection.OUTBOUND, "$destHost:$destPort", logType, methodOrResponse)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to send SIP datagram id=$sockId to $destHost:$destPort: ${e.message}", e)
+                Log.e(TAG, "Error sending SIP packet to $destHost:$destPort: ${e.message}")
             }
         }
     }
 
-    fun injectSimulatedPacket(rawSip: String) {
-        scope.launch {
-            handleIncomingPacket(rawSip, "127.0.0.1", profile.pcscfPort, sipSocket)
+    private fun determineLogType(msg: SipMessage): LogType {
+        return if (msg.isResponse) {
+            LogType.SIP_RESPONSE
+        } else {
+            when (msg.method.uppercase()) {
+                "REGISTER" -> LogType.SIP_REGISTER
+                "SUBSCRIBE" -> LogType.SIP_SUBSCRIBE
+                "INVITE" -> LogType.SIP_INVITE
+                "MESSAGE" -> LogType.SIP_MESSAGE
+                "INFO" -> LogType.SIP_INFO
+                "BYE" -> LogType.SIP_BYE
+                "ACK" -> LogType.SIP_ACK
+                else -> LogType.SYSTEM_EVENT
+            }
         }
     }
 
-    private fun logTraffic(rawText: String, direction: LogDirection, endpoint: String) {
-        val lines = rawText.lines()
-        val firstLine = lines.firstOrNull()?.trim() ?: "UNKNOWN"
-        val isMcptt = rawText.contains("mcptt", ignoreCase = true)
-        val hasErr = rawText.startsWith("SIP/2.0 4") || rawText.startsWith("SIP/2.0 5") || rawText.startsWith("SIP/2.0 6")
-
-        val hasAuth = rawText.contains("Authorization:", ignoreCase = true)
-        val methodOrResponse = when {
-            firstLine.startsWith("SIP/2.0 401", ignoreCase = true) -> "401"
-            firstLine.startsWith("SIP/2.0 200", ignoreCase = true) -> "200 OK"
-            firstLine.startsWith("SIP/2.0", ignoreCase = true) -> {
-                val parts = firstLine.split(" ", limit = 3)
-                if (parts.size >= 2) parts[1] else "SIP"
-            }
-            firstLine.startsWith("REGISTER", ignoreCase = true) && hasAuth -> "REGISTER + Authorization"
-            else -> firstLine.split(" ").firstOrNull() ?: "SIP"
-        }
-        val logType = when {
-            firstLine.startsWith("REGISTER", ignoreCase = true) -> LogType.SIP_REGISTER
-            firstLine.startsWith("INVITE", ignoreCase = true) -> LogType.SIP_INVITE
-            firstLine.startsWith("SUBSCRIBE", ignoreCase = true) -> LogType.SIP_SUBSCRIBE
-            firstLine.startsWith("MESSAGE", ignoreCase = true) -> LogType.SIP_MESSAGE
-            firstLine.startsWith("INFO", ignoreCase = true) -> LogType.SIP_INFO
-            firstLine.startsWith("BYE", ignoreCase = true) -> LogType.SIP_BYE
-            firstLine.startsWith("ACK", ignoreCase = true) -> LogType.SIP_ACK
-            firstLine.startsWith("SIP/2.0", ignoreCase = true) -> LogType.SIP_RESPONSE
-            else -> LogType.SYSTEM_EVENT
-        }
+    private fun logTraffic(
+        rawText: String,
+        direction: LogDirection,
+        remoteAddress: String,
+        type: LogType,
+        methodOrResponse: String
+    ) {
+        val firstLine = rawText.lines().firstOrNull()?.trim() ?: ""
+        val isMcptt = rawText.contains("+g.3gpp.mcptt", ignoreCase = true) ||
+                rawText.contains("mcptt", ignoreCase = true)
+        val hasErr = direction == LogDirection.INBOUND && (
+                firstLine.startsWith("SIP/2.0 4") ||
+                        firstLine.startsWith("SIP/2.0 5") ||
+                        firstLine.startsWith("SIP/2.0 6")
+                )
 
         val log = SipTrafficLog(
+            timestamp = System.currentTimeMillis(),
             direction = direction,
-            type = logType,
-            methodOrResponse = methodOrResponse,
-            remoteAddress = endpoint,
+            type = type,
+            methodOrResponse = methodOrResponse.ifBlank { firstLine },
+            remoteAddress = remoteAddress,
             summary = firstLine,
             rawPacket = rawText,
             isMcpttTagged = isMcptt,
@@ -1246,30 +1256,5 @@ class McpttSipStack {
         val clean = speaker.trim().removeSurrounding("<", ">")
         val user = clean.substringAfter("sip:").substringBefore("@")
         return user.ifBlank { clean }
-    }
-
-    private fun md5Hex(input: String): String {
-        return SipAuthHelper.md5Hex(input)
-    }
-
-    internal fun applyFloorFromBodyForTest(msg: SipMessage) {
-        applyFloorFromBody(msg)
-    }
-
-    internal fun setCallStateForTest(state: CallSessionState) {
-        _callState.value = state
-    }
-
-    internal fun setRegistrationStateForTest(state: RegistrationState) {
-        _registrationState.value = state
-    }
-
-    internal fun setFloorStateForTest(state: FloorState, speaker: String? = null) {
-        _floorState.value = state
-        _activeSpeaker.value = speaker
-    }
-
-    companion object {
-        private const val TAG = "McpttSipStack"
     }
 }

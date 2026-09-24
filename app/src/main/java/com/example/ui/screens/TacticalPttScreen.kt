@@ -245,7 +245,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                             val activePcscfText = selectedPcscf?.let { sel ->
                                 val srcTag = if (sel.isFallback) "[STATIC FALLBACK]" else "[DNS]"
                                 "P-CSCF: ${sel.endpoint.toHostPort()} $srcTag"
-                            } ?: "P-CSCF: ${profile.pcscfHost}:${profile.pcscfPort} [STATIC]"
+                            } ?: "P-CSCF: ${profile.pcscfHost}:${profile.pcscfPort} [STATIC FALLBACK]"
 
                             Text(
                                 text = activePcscfText,
@@ -770,7 +770,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                     "2. Add or select APN with Name='mcptt', APN='mcptt', APN Type='default'.\n" +
                     "3. Set 'mcptt' as preferred active mobile data APN.\n" +
                     "4. Confirm UE IP is assigned from pool 192.168.102.x.\n" +
-                    "5. P-CSCF is automatically discovered via cellular DNS (with static legacy fallback).",
+                    "5. P-CSCF is acquired via explicit FQDN DNS or honest legacy static fallback (172.30.104.240:5060).",
                     fontSize = 13.sp
                 )
             },

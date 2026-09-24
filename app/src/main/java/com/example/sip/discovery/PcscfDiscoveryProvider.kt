@@ -10,18 +10,28 @@ import kotlinx.coroutines.withContext
 import java.net.InetAddress
 
 /**
- * Clean client-side abstraction for discovering and selecting the P-CSCF endpoint.
+ * Clean client-side abstraction for acquiring and selecting the authoritative P-CSCF endpoint.
+ *
+ * Distinguishes:
+ * 1. DISCOVERY / PROVISIONING: Network/platform-provisioned P-CSCF information (PCO/ISIM - unavailable to standard APK).
+ * 2. DNS RESOLUTION: A/AAAA resolution of an explicitly supplied/known P-CSCF FQDN over the bound MCPTT cellular network.
+ * 3. STATIC FALLBACK: Proven legacy fallback configuration (172.30.104.240:5060) ensuring 100% backward compatibility.
  */
 interface PcscfDiscoveryProvider {
     val discoveryState: StateFlow<PcscfDiscoveryState>
     val selectedPcscf: StateFlow<SelectedPcscf?>
 
     /**
-     * Executes discovery against the active cellular network or falls back cleanly to legacy configuration.
+     * Executes P-CSCF acquisition.
+     *
+     * @param network The bound MCPTT cellular Network, if available.
+     * @param explicitPcscfFqdn An explicitly supplied/provisioned P-CSCF FQDN (if any).
+     *                          Does NOT guess names like pcscf.<realm> or sip.<realm>.
+     * @param legacyFallback The configured fallback endpoint (typically 172.30.104.240:5060).
      */
     suspend fun discover(
         network: Network?,
-        realm: String,
+        explicitPcscfFqdn: String?,
         legacyFallback: PcscfEndpoint
     ): SelectedPcscf
 
@@ -34,14 +44,13 @@ interface PcscfDiscoveryProvider {
 /**
  * Standard implementation of PcscfDiscoveryProvider.
  *
- * Implements 3GPP discovery over the bound cellular Network:
- * 1. Resolves candidate P-CSCF FQDNs using the cellular network's DNS:
- *    - pcscf.<realm>
- *    - sip.<realm>
- * 2. Validates candidates.
- * 3. Selects best candidate deterministically.
- * 4. If DNS discovery fails or network has no DNS mapping, cleanly falls back
- *    to the legacy static P-CSCF, clearly tagged as STATIC_LEGACY with isFallback=true.
+ * Implements an honest acquisition model:
+ * - If an explicit P-CSCF FQDN is supplied (e.g. from carrier provisioning or user settings),
+ *   resolves it using the cellular Network DNS (Network.getAllByName).
+ * - Does NOT guess arbitrary hostnames from the IMS realm (e.g. pcscf.<realm>).
+ * - If no explicit FQDN is supplied, or DNS returns no addresses, or discovery is unavailable
+ *   to this standard APK, transparently selects the legacy fallback with:
+ *   "P-CSCF discovery unavailable to this APK; using legacy static fallback".
  */
 class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
 
@@ -62,88 +71,86 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
 
     override suspend fun discover(
         network: Network?,
-        realm: String,
+        explicitPcscfFqdn: String?,
         legacyFallback: PcscfEndpoint
     ): SelectedPcscf = withContext(Dispatchers.IO) {
-        Log.i(TAG, "P-CSCF discovery started. Network: $network, Realm: $realm, LegacyFallback: ${legacyFallback.toHostPort()}")
-        _discoveryState.value = PcscfDiscoveryState.Discovering(PcscfDiscoverySource.DNS_A_AAAA)
+        val fqdn = explicitPcscfFqdn?.trim() ?: ""
+        Log.i(TAG, "P-CSCF acquisition started. Network: $network, ExplicitFQDN: '$fqdn', LegacyFallback: ${legacyFallback.toHostPort()}")
 
         val candidates = mutableListOf<PcscfEndpoint>()
 
-        // 1. Attempt cellular DNS discovery if network is bound or custom resolver is provided
-        if ((network != null || dnsResolver != null) && realm.isNotBlank()) {
-            val fqdnsToTry = listOf(
-                "pcscf.$realm",
-                "sip.$realm",
-                realm
-            )
-
-            for (fqdn in fqdnsToTry) {
-                try {
-                    Log.d(TAG, "Querying cellular DNS for P-CSCF FQDN: $fqdn")
-                    val addresses: Array<InetAddress> = if (dnsResolver != null) {
-                        dnsResolver!!.invoke(network, fqdn)
-                    } else if (network != null) {
-                        network.getAllByName(fqdn)
-                    } else {
-                        emptyArray()
-                    }
-
-                    for (addr in addresses) {
-                        val hostStr = addr.hostAddress ?: continue
-                        val candidate = PcscfEndpoint(
-                            host = hostStr,
-                            port = legacyFallback.port, // 5060 standard SIP
-                            transport = legacyFallback.transport,
-                            source = PcscfDiscoverySource.DNS_A_AAAA,
-                            priority = 10,
-                            weight = 0
-                        )
-                        if (!candidates.any { it.host == candidate.host && it.port == candidate.port }) {
-                            Log.i(TAG, "Discovered Candidate P-CSCF via cellular DNS: ${candidate.toHostPort()} ($fqdn)")
-                            candidates.add(candidate)
-                        }
-                    }
-                    if (candidates.isNotEmpty()) {
-                        break // Found candidates with preferred FQDN
-                    }
-                } catch (e: Exception) {
-                    Log.d(TAG, "Cellular DNS lookup for $fqdn did not yield results: ${e.message}")
+        if (fqdn.isNotEmpty()) {
+            _discoveryState.value = PcscfDiscoveryState.Discovering(PcscfDiscoverySource.DNS_A_AAAA)
+            try {
+                Log.i(TAG, "Resolving explicit P-CSCF FQDN: '$fqdn' over cellular network...")
+                val addresses: Array<InetAddress> = if (dnsResolver != null) {
+                    dnsResolver!!.invoke(network, fqdn)
+                } else if (network != null) {
+                    network.getAllByName(fqdn)
+                } else {
+                    emptyArray()
                 }
+
+                for (addr in addresses) {
+                    val hostStr = addr.hostAddress ?: continue
+                    val candidate = PcscfEndpoint(
+                        host = hostStr,
+                        port = legacyFallback.port,
+                        transport = legacyFallback.transport,
+                        source = PcscfDiscoverySource.DNS_A_AAAA,
+                        priority = 10,
+                        weight = 0
+                    )
+                    if (!candidates.any { it.host == candidate.host && it.port == candidate.port }) {
+                        Log.i(TAG, "Resolved P-CSCF address: ${candidate.toHostPort()} from FQDN '$fqdn'")
+                        candidates.add(candidate)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "DNS resolution for explicit FQDN '$fqdn' failed: ${e.message}")
             }
-        } else {
-            Log.i(TAG, "No active cellular network bound or realm empty; skipping cellular DNS discovery")
         }
 
-        // 2. Evaluate candidates or fallback
         val selection: SelectedPcscf
         if (candidates.isNotEmpty()) {
-            // Deterministic selection: prefer IPv4 for compatibility with current IPv4 bearer, or first candidate
-            val bestCandidate = candidates.firstOrNull { !it.isIpv6 } ?: candidates.first()
+            // Deterministic candidate selection:
+            // 1. Prefer IPv4 for compatibility with current IPv4 LTE bearer pool (192.168.102.x)
+            // 2. Sort by priority descending, then lexicographical host order
+            val sorted = candidates.sortedWith(
+                compareBy<PcscfEndpoint> { it.isIpv6 } // false (IPv4) first
+                    .thenByDescending { it.priority }
+                    .thenBy { it.host }
+            )
+            val chosen = sorted.first()
             selection = SelectedPcscf(
-                endpoint = bestCandidate,
-                source = bestCandidate.source,
+                endpoint = chosen,
+                source = PcscfDiscoverySource.DNS_A_AAAA,
                 isFallback = false,
                 networkInfo = network?.toString(),
-                candidatesEvaluated = candidates,
-                statusDetail = "Successfully discovered ${candidates.size} candidate(s) via cellular DNS"
+                candidatesEvaluated = sorted,
+                statusDetail = "Resolved ${candidates.size} address(es) for explicit FQDN '$fqdn' via cellular DNS"
             )
-            Log.i(TAG, "Selected P-CSCF [DISCOVERED]: ${selection.endpoint.toHostPort()} from source ${selection.source}")
+            Log.i(TAG, "Authoritative P-CSCF [DISCOVERED via DNS]: ${selection.endpoint.toHostPort()}")
             _selectedPcscf.value = selection
             _discoveryState.value = PcscfDiscoveryState.Discovered(selection)
         } else {
-            // Clean legacy fallback
+            // Honest legacy fallback
+            val reason = if (fqdn.isEmpty()) {
+                "P-CSCF discovery unavailable to this APK; using legacy static fallback"
+            } else {
+                "DNS resolution for '$fqdn' returned no addresses; using legacy static fallback"
+            }
             selection = SelectedPcscf(
                 endpoint = legacyFallback.copy(source = PcscfDiscoverySource.STATIC_LEGACY),
                 source = PcscfDiscoverySource.STATIC_LEGACY,
                 isFallback = true,
                 networkInfo = network?.toString(),
                 candidatesEvaluated = emptyList(),
-                statusDetail = "Cellular DNS returned no P-CSCF records; using legacy static configuration"
+                statusDetail = reason
             )
-            Log.i(TAG, "Falling back to legacy static P-CSCF: ${selection.endpoint.toHostPort()} (Fallback reason: ${selection.statusDetail})")
+            Log.i(TAG, "Authoritative P-CSCF [STATIC FALLBACK]: ${selection.endpoint.toHostPort()} (Reason: $reason)")
             _selectedPcscf.value = selection
-            _discoveryState.value = PcscfDiscoveryState.Fallback(selection, selection.statusDetail)
+            _discoveryState.value = PcscfDiscoveryState.Fallback(selection, reason)
         }
 
         selection
