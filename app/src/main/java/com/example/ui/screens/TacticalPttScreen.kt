@@ -513,8 +513,8 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
             floorState == FloorState.LISTENING -> "LISTENING"
             floorState == FloorState.REQUESTING -> "REQUESTING..."
             floorState == FloorState.RELEASING -> "RELEASING"
-            floorState == FloorState.GRANTED && isPttHeld -> "SPEAKING"
-            floorState == FloorState.GRANTED -> "RELEASE FLOOR"
+            floorState == FloorState.GRANTED && isPttHeld -> "SPEAKING (PTT HELD)"
+            floorState == FloorState.GRANTED -> "RELEASE FLOOR (SPEAKING)"
             else -> "REQUEST FLOOR"
         }
 
@@ -573,7 +573,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = if (!isDialogConnected) "REQUEST FLOOR (SESSION IDLE)" else floorButtonText,
+                text = if (!isDialogConnected) "REQUEST FLOOR (START CALL FIRST)" else floorButtonText,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace

@@ -96,12 +96,12 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
 
         // Wire floor grant callback
         sipStack.onFloorGranted = {
-            if (pttHeld && !grantTonePlayed) {
+            if (!grantTonePlayed) {
                 grantTonePlayed = true
                 audioEngine.playGrantTone()
             }
             val media = sipStack.negotiatedMedia.value
-            if (pttHeld && media != null) {
+            if (media != null) {
                 audioEngine.startMicrophoneTransmission(media.host, media.rtpPort)
             }
         }
@@ -109,6 +109,14 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             audioEngine.boundPort.collect { port ->
                 sipStack.setLocalRtpPort(port)
+            }
+        }
+
+        viewModelScope.launch {
+            sipStack.apnManager?.networkStatus?.collect { netStatus ->
+                if (netStatus is ApnNetworkStatus.Bound) {
+                    audioEngine.bindToNetwork(sipStack.apnManager?.activeNetwork)
+                }
             }
         }
 
@@ -134,7 +142,7 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
             }.collect { (state, media) ->
                 when (state) {
                     FloorState.GRANTED -> {
-                        if (pttHeld && media != null) {
+                        if (media != null) {
                             if (!grantTonePlayed) {
                                 grantTonePlayed = true
                                 audioEngine.playGrantTone()
@@ -172,6 +180,7 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
         repository.saveProfile(profile)
         sipStack.updateProfile(getApplication(), profile)
         audioEngine.init(profile.localRtpPort, sipStack.apnManager)
+        audioEngine.bindToNetwork(sipStack.apnManager?.activeNetwork)
         sipStack.setLocalRtpPort(audioEngine.boundPort.value)
     }
 
@@ -214,6 +223,7 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
             android.util.Log.w("McpttViewModel", "requestFloor ignored: already in state ${sipStack.floorState.value}")
             return
         }
+        pttHeld = true
         sipStack.requestFloor()
     }
 
@@ -226,6 +236,7 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
             audioEngine.playReleaseTone()
             sipStack.releaseFloor()
             audioEngine.flushPlayback()
+            audioEngine.applyPlaybackRouting()
         }
     }
 

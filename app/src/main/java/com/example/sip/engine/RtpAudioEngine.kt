@@ -3,6 +3,7 @@ package com.example.sip.engine
 import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -139,6 +140,18 @@ class RtpAudioEngine {
         }
     }
 
+    fun bindToNetwork(network: Network?) {
+        val socket = rtpSocket ?: return
+        if (network != null && !socket.isClosed) {
+            try {
+                network.bindSocket(socket)
+                Log.i(TAG, "RTP socket successfully bound to network $network")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to bind RTP socket to network $network: ${e.message}")
+            }
+        }
+    }
+
     private fun bindEvenRtpPort(ds: DatagramSocket, preferred: Int): Int {
         val start = if (preferred >= 1024 && preferred % 2 == 0) {
             preferred
@@ -249,13 +262,31 @@ class RtpAudioEngine {
             )
 
             try {
-                audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    sampleRate,
-                    channelConfigIn,
-                    audioFormat,
-                    minBufSize * 2
-                )
+                var record: AudioRecord? = null
+                try {
+                    record = AudioRecord(
+                        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                        sampleRate,
+                        channelConfigIn,
+                        audioFormat,
+                        maxOf(minBufSize * 4, 4096)
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "VOICE_COMMUNICATION audio source failed: ${e.message}")
+                }
+
+                if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+                    try { record?.release() } catch (_: Exception) {}
+                    record = AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        sampleRate,
+                        channelConfigIn,
+                        audioFormat,
+                        maxOf(minBufSize * 4, 4096)
+                    )
+                }
+
+                audioRecord = record
 
                 if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                     Log.e(TAG, "AudioRecord failed to initialize")
@@ -275,7 +306,9 @@ class RtpAudioEngine {
                     if (readSamples > 0) {
                         var sum = 0.0
                         for (i in 0 until readSamples) {
-                            sum += buffer[i] * buffer[i]
+                            val boosted = (buffer[i] * 1.8f).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                            buffer[i] = boosted
+                            sum += boosted * boosted
                         }
                         val amplitude = Math.sqrt(sum / readSamples)
                         _micAudioLevel.value = (amplitude / 32768.0).toFloat().coerceIn(0f, 1f)
@@ -344,9 +377,12 @@ class RtpAudioEngine {
     fun flushPlayback() {
         synchronized(trackLock) {
             try {
-                audioTrack?.pause()
-                audioTrack?.flush()
-                audioTrack?.play()
+                val track = audioTrack
+                if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                    if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                        track.play()
+                    }
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "flushPlayback error: ${e.message}")
             }
@@ -403,21 +439,46 @@ class RtpAudioEngine {
                     val payloadLen = len - 12
                     val pcmShorts = when {
                         payloadLen == samplesPerPacket -> {
-                            ShortArray(payloadLen) { i -> ulawToLinear(recvBuf[12 + i].toInt() and 0xFF) }
+                            ShortArray(payloadLen) { i ->
+                                val sample = ulawToLinear(recvBuf[12 + i].toInt() and 0xFF)
+                                (sample * 1.5f).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                            }
                         }
                         payloadLen == samplesPerPacket * 2 -> {
                             ShortArray(samplesPerPacket) { i ->
                                 val low = recvBuf[12 + i * 2].toInt() and 0xFF
                                 val high = recvBuf[12 + i * 2 + 1].toInt()
-                                ((high shl 8) or low).toShort()
+                                val sample = ((high shl 8) or low)
+                                (sample * 1.5f).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
                             }
                         }
                         else -> {
-                            ShortArray(payloadLen) { i -> ulawToLinear(recvBuf[12 + i].toInt() and 0xFF) }
+                            ShortArray(payloadLen) { i ->
+                                val sample = ulawToLinear(recvBuf[12 + i].toInt() and 0xFF)
+                                (sample * 1.5f).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                            }
                         }
                     }
                     synchronized(trackLock) {
-                        audioTrack?.write(pcmShorts, 0, pcmShorts.size)
+                        var track = audioTrack
+                        if (track == null || track.state != AudioTrack.STATE_INITIALIZED) {
+                            try { track?.release() } catch (_: Exception) {}
+                            track = buildPlaybackTrack(minBufSize)
+                            audioTrack = track
+                        }
+                        if (track.state == AudioTrack.STATE_INITIALIZED) {
+                            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                                try {
+                                    track.play()
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "AudioTrack.play error: ${e.message}")
+                                }
+                            }
+                            val written = track.write(pcmShorts, 0, pcmShorts.size)
+                            if (written < 0) {
+                                Log.w(TAG, "AudioTrack.write error code: $written")
+                            }
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -445,15 +506,33 @@ class RtpAudioEngine {
         val am = audioManager ?: return
         try {
             am.mode = AudioManager.MODE_IN_COMMUNICATION
-            am.isSpeakerphoneOn = true
-            val stream = AudioManager.STREAM_VOICE_CALL
-            val max = am.getStreamMaxVolume(stream)
-            if (max > 0) {
-                am.setStreamVolume(stream, max, 0)
+
+            // Route communication audio directly to the phone's physical loudspeaker
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val devices = am.availableCommunicationDevices
+                val speaker = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                if (speaker != null) {
+                    val ok = am.setCommunicationDevice(speaker)
+                    Log.i(TAG, "setCommunicationDevice(SPEAKER) result=$ok")
+                }
             }
+            @Suppress("DEPRECATION")
+            am.isSpeakerphoneOn = true
+
+            // Maximize volume for both media and voice streams so PTT is always audible
+            val musicMax = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val currentMusic = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (musicMax > 0 && currentMusic < (musicMax * 0.75f)) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, (musicMax * 0.9f).toInt().coerceAtLeast(1), 0)
+            }
+            val voiceMax = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+            if (voiceMax > 0) {
+                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, voiceMax, 0)
+            }
+
             if (Build.VERSION.SDK_INT >= 26) {
                 val attrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
                 val req = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -462,10 +541,10 @@ class RtpAudioEngine {
                 am.requestAudioFocus(req)
             } else {
                 @Suppress("DEPRECATION")
-                am.requestAudioFocus(null, stream, AudioManager.AUDIOFOCUS_GAIN)
+                am.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
             }
             synchronized(trackLock) {
-                audioTrack?.setVolume(1f)
+                audioTrack?.setVolume(1.0f)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Playback routing: ${e.message}")
@@ -473,10 +552,11 @@ class RtpAudioEngine {
     }
 
     private fun buildPlaybackTrack(minBufSize: Int): AudioTrack {
+        val bufferSize = maxOf(minBufSize * 4, 8192)
         val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
@@ -487,10 +567,10 @@ class RtpAudioEngine {
                     .setChannelMask(channelConfigOut)
                     .build()
             )
-            .setBufferSizeInBytes(minBufSize * 2)
+            .setBufferSizeInBytes(bufferSize)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-        track.setVolume(1f)
+        track.setVolume(1.0f)
         return track
     }
 
