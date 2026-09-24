@@ -38,6 +38,8 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
     val sipProfile: StateFlow<SipProfile> = repository.sipProfile
     val registrationState: StateFlow<RegistrationState> = sipStack.registrationState
     val registrationFailureReason: StateFlow<String?> = sipStack.registrationFailureReason
+    val selectedPcscf = sipStack.selectedPcscf
+    val pcscfDiscoveryState = sipStack.pcscfDiscoveryState
     val callState: StateFlow<CallSessionState> = sipStack.callState
     val floorState: StateFlow<FloorState> = sipStack.floorState
     val activeSpeaker: StateFlow<String?> = sipStack.activeSpeaker
@@ -349,8 +351,15 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
             append("MCPTT CLIENT - SIP & MEDIA TRAFFIC INSPECTOR LOG EXPORT\n")
             append("Generated: ${dateFormat.format(Date())}\n")
             append("Subscriber IMSI: ${profile.imsi} | IMPU: ${profile.mcpttId}\n")
-            append("P-CSCF: ${profile.pcscfHost}:${profile.pcscfPort} | Local SIP Port: ${profile.localSipPort}\n")
-            append("Local APN IPv4: ${sipStack.apnManager?.boundIp ?: "Unbound"}\n")
+            val sel = selectedPcscf.value
+            val pDesc = if (sel != null) {
+                "${sel.endpoint.toHostPort()} [Source: ${sel.source.name} | Fallback: ${sel.isFallback}]"
+            } else {
+                "${profile.pcscfHost}:${profile.pcscfPort} [Static Profile Default]"
+            }
+            append("Authoritative P-CSCF: $pDesc\n")
+            append("Discovery State: ${pcscfDiscoveryState.value}\n")
+            append("Local SIP Port: ${profile.localSipPort} | Local APN IPv4: ${sipStack.apnManager?.boundIp ?: "Unbound"}\n")
             append("Total Packets Exported: ${logsToExport.size}\n")
             append("================================================================================\n\n")
 

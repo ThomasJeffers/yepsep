@@ -2,6 +2,12 @@ package com.example.sip.engine
 
 import android.content.Context
 import android.util.Log
+import com.example.sip.discovery.DefaultPcscfDiscoveryProvider
+import com.example.sip.discovery.PcscfDiscoveryProvider
+import com.example.sip.discovery.PcscfDiscoverySource
+import com.example.sip.discovery.PcscfDiscoveryState
+import com.example.sip.discovery.PcscfEndpoint
+import com.example.sip.discovery.SelectedPcscf
 import com.example.sip.model.LogDirection
 import com.example.sip.model.LogType
 import com.example.sip.model.SipMessage
@@ -105,6 +111,24 @@ class McpttSipStack {
     var apnManager: McpttApnNetworkManager? = null
         private set
 
+    // Client-side P-CSCF Discovery Abstraction
+    val pcscfDiscoveryProvider: PcscfDiscoveryProvider = DefaultPcscfDiscoveryProvider()
+    val selectedPcscf: StateFlow<SelectedPcscf?> = pcscfDiscoveryProvider.selectedPcscf
+    val pcscfDiscoveryState: StateFlow<PcscfDiscoveryState> = pcscfDiscoveryProvider.discoveryState
+
+    /**
+     * Resolves the authoritative P-CSCF host to send SIP traffic to.
+     * Uses the selected P-CSCF from discovery, or legacy fallback from profile if discovery has not run yet.
+     */
+    val currentPcscfHost: String
+        get() = selectedPcscf.value?.host ?: profile.pcscfHost
+
+    /**
+     * Resolves the authoritative P-CSCF port to send SIP traffic to.
+     */
+    val currentPcscfPort: Int
+        get() = selectedPcscf.value?.port ?: profile.pcscfPort
+
     private val _negotiatedMedia = MutableStateFlow<NegotiatedMedia?>(null)
     val negotiatedMedia: StateFlow<NegotiatedMedia?> = _negotiatedMedia.asStateFlow()
 
@@ -156,6 +180,17 @@ class McpttSipStack {
 
     fun start(context: Context, initialProfile: SipProfile) {
         this.profile = initialProfile
+
+        // Seed initial P-CSCF state with legacy static fallback immediately
+        pcscfDiscoveryProvider.selectManualOverride(
+            PcscfEndpoint(
+                host = initialProfile.pcscfHost,
+                port = initialProfile.pcscfPort,
+                transport = initialProfile.transport,
+                source = PcscfDiscoverySource.STATIC_LEGACY
+            )
+        )
+
         val netMgr = McpttApnNetworkManager(context.applicationContext, scope)
         this.apnManager = netMgr
         netMgr.updateConfig(initialProfile.apnName, initialProfile.apnPrefix)
@@ -197,6 +232,22 @@ class McpttSipStack {
                                 }
                             }
                         }
+
+                        // Trigger P-CSCF discovery over the bound cellular network
+                        scope.launch {
+                            val legacyFallback = PcscfEndpoint(
+                                host = profile.pcscfHost,
+                                port = profile.pcscfPort,
+                                transport = profile.transport,
+                                source = PcscfDiscoverySource.STATIC_LEGACY
+                            )
+                            pcscfDiscoveryProvider.discover(
+                                network = netMgr.activeNetwork,
+                                realm = profile.realm,
+                                legacyFallback = legacyFallback
+                            )
+                        }
+
                         if (_registrationState.value == RegistrationState.UNREGISTERED ||
                             _registrationState.value == RegistrationState.NETWORK_UNAVAILABLE) {
                             _registrationState.value = RegistrationState.MCPTT_APN_BOUND
@@ -232,6 +283,21 @@ class McpttSipStack {
         if (portChanged) {
             Log.i(TAG, "SIP local port changed to ${newProfile.localSipPort}, recreating socket")
             recreateSocket()
+        }
+
+        // Re-run discovery with updated legacy fallback / realm
+        scope.launch {
+            val legacyFallback = PcscfEndpoint(
+                host = newProfile.pcscfHost,
+                port = newProfile.pcscfPort,
+                transport = newProfile.transport,
+                source = PcscfDiscoverySource.STATIC_LEGACY
+            )
+            pcscfDiscoveryProvider.discover(
+                network = apnManager?.activeNetwork,
+                realm = newProfile.realm,
+                legacyFallback = legacyFallback
+            )
         }
     }
 
@@ -566,7 +632,7 @@ class McpttSipStack {
             }
         }
 
-        val host = mediaIp ?: profile.pcscfHost
+        val host = mediaIp ?: currentPcscfHost
         val port = rtpPort ?: profile.localRtpPort
         val media = NegotiatedMedia(host, port, rtcpPort ?: (port + 1))
         _negotiatedMedia.value = media
@@ -584,16 +650,16 @@ class McpttSipStack {
         registerFromTag = "reg-" + UUID.randomUUID().toString().replace("-", "").take(8)
         registerCSeq = 1
 
-        Log.i(TAG, "REGISTER SEND:\n  callId=$registerCallId\n  cseq=$registerCSeq")
+        Log.i(TAG, "REGISTER SEND via P-CSCF destination $currentPcscfHost:$currentPcscfPort:\n  callId=$registerCallId\n  cseq=$registerCSeq")
         sendRegisterPacket(registerCSeq, authHeader = null)
     }
 
     private fun sendRegisterPacket(cseq: Int, authHeader: String?) {
         val sockId = sipSocket?.let { System.identityHashCode(it).toString(16) } ?: "unknown"
         if (!authHeader.isNullOrBlank()) {
-            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq authorization=true")
+            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq authorization=true dest=$currentPcscfHost:$currentPcscfPort")
         } else {
-            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq")
+            Log.i(TAG, "SIP TX id=$sockId method=REGISTER cseq=$cseq dest=$currentPcscfHost:$currentPcscfPort")
         }
 
         val localIp = getLocalIpAddress()
@@ -628,7 +694,7 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     private fun handleRegister401(msg: SipMessage, sockId: String) {
@@ -745,7 +811,7 @@ class McpttSipStack {
             append(sdpBody)
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     private fun sendAck(okMsg: SipMessage) {
@@ -771,7 +837,7 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     private fun send200OkForInvite(inviteMsg: SipMessage) {
@@ -812,7 +878,7 @@ class McpttSipStack {
             append(sdpBody)
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     fun requestFloor() {
@@ -883,7 +949,7 @@ class McpttSipStack {
             append(body)
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     fun sendInDialogFloorAction(actionName: String) {
@@ -925,7 +991,7 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
         _callState.value = CallSessionState.IDLE
         _floorState.value = FloorState.IDLE
         _activeSpeaker.value = null
@@ -954,7 +1020,7 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     fun sendEmergencyAlert(customNote: String = "EMERGENCY SOS ALERT") {
@@ -990,7 +1056,7 @@ class McpttSipStack {
             append(body)
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     fun sendSipMessageText(targetUri: String, text: String) {
@@ -1014,7 +1080,7 @@ class McpttSipStack {
             append(text)
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     private fun sendResponse(code: Int, text: String, requestMsg: SipMessage) {
@@ -1032,7 +1098,7 @@ class McpttSipStack {
             append("Content-Length: 0\r\n\r\n")
         }
 
-        sendRawSip(sipPacket, profile.pcscfHost, profile.pcscfPort)
+        sendRawSip(sipPacket, currentPcscfHost, currentPcscfPort)
     }
 
     private fun sendRawSip(rawSip: String, destHost: String, destPort: Int) {

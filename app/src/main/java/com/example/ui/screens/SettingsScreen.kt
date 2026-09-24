@@ -221,17 +221,18 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         Spacer(modifier = Modifier.height(12.dp))
 
         // SECTION 2: SIP PROXY / P-CSCF
-        Text("2. SIP PROXY / P-CSCF (IMS ENTRY POINT)", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+        Text("2. P-CSCF ENDPOINT & FALLBACK CONFIGURATION", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+        Text("Used for direct connection or as legacy fallback if cellular DNS discovery returns no records.", fontSize = 10.sp, color = HighDensityTextSecondary)
         Spacer(modifier = Modifier.height(6.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Box(modifier = Modifier.weight(2f)) {
-                OutlinedField("P-CSCF Host IP", pcscfHost) { pcscfHost = it }
+                OutlinedField("Static Fallback Host/FQDN", pcscfHost) { pcscfHost = it }
             }
             Box(modifier = Modifier.weight(1f)) {
-                OutlinedField("P-CSCF Port", pcscfPort) { pcscfPort = it }
+                OutlinedField("Port", pcscfPort) { pcscfPort = it }
             }
         }
 
