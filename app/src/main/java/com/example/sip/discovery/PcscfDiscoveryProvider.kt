@@ -22,6 +22,11 @@ interface PcscfDiscoveryProvider {
     val selectedPcscf: StateFlow<SelectedPcscf?>
 
     /**
+     * Resets or initiates the discovery lifecycle to DISCOVERING.
+     */
+    fun startDiscovery()
+
+    /**
      * Executes P-CSCF acquisition.
      *
      * @param network The bound MCPTT cellular Network, if available.
@@ -50,7 +55,7 @@ interface PcscfDiscoveryProvider {
  * - Does NOT guess arbitrary hostnames from the IMS realm (e.g. pcscf.<realm>).
  * - If no explicit FQDN is supplied, or DNS returns no addresses, or discovery is unavailable
  *   to this standard APK, transparently selects the legacy fallback with:
- *   "P-CSCF discovery unavailable to this APK; using legacy static fallback".
+ *   "no P-CSCF FQDN provisioned" or "DNS resolution for '<fqdn>' returned no addresses".
  */
 class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
 
@@ -58,7 +63,7 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
         private const val TAG = "PcscfDiscovery"
     }
 
-    private val _discoveryState = MutableStateFlow<PcscfDiscoveryState>(PcscfDiscoveryState.Idle)
+    private val _discoveryState = MutableStateFlow<PcscfDiscoveryState>(PcscfDiscoveryState.Discovering(PcscfDiscoverySource.DNS_A_AAAA))
     override val discoveryState: StateFlow<PcscfDiscoveryState> = _discoveryState.asStateFlow()
 
     private val _selectedPcscf = MutableStateFlow<SelectedPcscf?>(null)
@@ -69,13 +74,24 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
      */
     var dnsResolver: (suspend (Network?, String) -> Array<InetAddress>)? = null
 
+    override fun startDiscovery() {
+        _selectedPcscf.value = null
+        _discoveryState.value = PcscfDiscoveryState.Discovering(PcscfDiscoverySource.DNS_A_AAAA)
+    }
+
     override suspend fun discover(
         network: Network?,
         explicitPcscfFqdn: String?,
         legacyFallback: PcscfEndpoint
     ): SelectedPcscf = withContext(Dispatchers.IO) {
         val fqdn = explicitPcscfFqdn?.trim() ?: ""
-        Log.i(TAG, "P-CSCF acquisition started. Network: $network, ExplicitFQDN: '$fqdn', LegacyFallback: ${legacyFallback.toHostPort()}")
+        Log.i(TAG, "P-CSCF discovery started on MCPTT network")
+        Log.i(TAG, "P-CSCF DNS FQDN=${if (fqdn.isNotEmpty()) fqdn else "<none>"}")
+
+        // Log unavailability of carrier/platform-restricted mechanisms honestly
+        Log.d(TAG, "P-CSCF DHCP Option 120 unavailable: cellular DHCP options not exposed to non-carrier app")
+        Log.d(TAG, "P-CSCF 3GPP NAS PCO unavailable: requires carrier privileges")
+        Log.d(TAG, "P-CSCF UICC ISIM EF_PCSCF unavailable: requires carrier privileges (READ_PRIVILEGED_PHONE_STATE)")
 
         val candidates = mutableListOf<PcscfEndpoint>()
 
@@ -109,6 +125,8 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
             } catch (e: Exception) {
                 Log.w(TAG, "DNS resolution for explicit FQDN '$fqdn' failed: ${e.message}")
             }
+        } else {
+            Log.i(TAG, "P-CSCF DNS discovery: no P-CSCF FQDN provisioned")
         }
 
         val selection: SelectedPcscf
@@ -130,40 +148,44 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
                 candidatesEvaluated = sorted,
                 statusDetail = "Resolved ${candidates.size} address(es) for explicit FQDN '$fqdn' via cellular DNS"
             )
-            Log.i(TAG, "Authoritative P-CSCF [DISCOVERED via DNS]: ${selection.endpoint.toHostPort()}")
+            Log.i(TAG, "P-CSCF discovery result=${selection.source.name} ${selection.endpoint.toHostPort()}")
             _selectedPcscf.value = selection
             _discoveryState.value = PcscfDiscoveryState.Discovered(selection)
         } else {
-            // Honest legacy fallback
-            val reason = if (fqdn.isEmpty()) {
-                "P-CSCF discovery unavailable to this APK; using legacy static fallback"
+            // Static legacy fallback is selected ONLY after all implemented discovery fails
+            val fallbackReason = if (fqdn.isEmpty()) {
+                "no P-CSCF FQDN provisioned"
             } else {
-                "DNS resolution for '$fqdn' returned no addresses; using legacy static fallback"
+                "DNS resolution for '$fqdn' returned no addresses"
             }
+            Log.i(TAG, "P-CSCF fallback selected because=$fallbackReason")
+
+            val fallbackEndpoint = legacyFallback.copy(source = PcscfDiscoverySource.STATIC_LEGACY)
             selection = SelectedPcscf(
-                endpoint = legacyFallback.copy(source = PcscfDiscoverySource.STATIC_LEGACY),
+                endpoint = fallbackEndpoint,
                 source = PcscfDiscoverySource.STATIC_LEGACY,
                 isFallback = true,
                 networkInfo = network?.toString(),
                 candidatesEvaluated = emptyList(),
-                statusDetail = reason
+                statusDetail = fallbackReason
             )
-            Log.i(TAG, "Authoritative P-CSCF [STATIC FALLBACK]: ${selection.endpoint.toHostPort()} (Reason: $reason)")
+            Log.i(TAG, "P-CSCF discovery result=${selection.source.name} ${selection.endpoint.toHostPort()}")
             _selectedPcscf.value = selection
-            _discoveryState.value = PcscfDiscoveryState.Fallback(selection, reason)
+            _discoveryState.value = PcscfDiscoveryState.Fallback(selection, fallbackReason)
         }
 
         selection
     }
 
     override fun selectManualOverride(endpoint: PcscfEndpoint) {
+        val isLegacy = endpoint.source == PcscfDiscoverySource.STATIC_LEGACY
         val selection = SelectedPcscf(
             endpoint = endpoint,
             source = endpoint.source,
-            isFallback = endpoint.source == PcscfDiscoverySource.STATIC_LEGACY,
-            statusDetail = "Manually selected / updated endpoint"
+            isFallback = isLegacy,
+            statusDetail = if (isLegacy) "Manual legacy static fallback" else "Manual override"
         )
-        Log.i(TAG, "P-CSCF manually set to: ${selection.endpoint.toHostPort()} (${selection.source})")
+        Log.i(TAG, "P-CSCF manually set to: ${selection.endpoint.toHostPort()} (${selection.source.name})")
         _selectedPcscf.value = selection
         if (selection.isFallback) {
             _discoveryState.value = PcscfDiscoveryState.Fallback(selection, "Manual legacy config")

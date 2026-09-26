@@ -73,6 +73,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.example.sip.discovery.PcscfDiscoveryState
 import com.example.sip.engine.ApnNetworkStatus
 import com.example.sip.engine.CallSessionState
 import com.example.sip.engine.FloorState
@@ -242,10 +243,20 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                                     }
                             )
                         } else {
-                            val activePcscfText = selectedPcscf?.let { sel ->
-                                val srcTag = if (sel.isFallback) "[STATIC FALLBACK]" else "[DNS]"
-                                "P-CSCF: ${sel.endpoint.toHostPort()} $srcTag"
-                            } ?: "P-CSCF: ${profile.pcscfHost}:${profile.pcscfPort} [STATIC FALLBACK]"
+                            val activePcscfText = when {
+                                pcscfDiscoveryState is PcscfDiscoveryState.Discovering -> {
+                                    selectedPcscf?.let { sel ->
+                                        "P-CSCF: ${sel.endpoint.toHostPort()} [DISCOVERING]"
+                                    } ?: "P-CSCF: [DISCOVERING]"
+                                }
+                                selectedPcscf != null -> {
+                                    val sel = selectedPcscf!!
+                                    "P-CSCF: ${sel.endpoint.toHostPort()} [${sel.source.name}]"
+                                }
+                                else -> {
+                                    "P-CSCF: [DISCOVERING]"
+                                }
+                            }
 
                             Text(
                                 text = activePcscfText,

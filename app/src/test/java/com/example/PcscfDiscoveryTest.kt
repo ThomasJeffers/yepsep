@@ -10,7 +10,9 @@ import com.example.sip.model.SipMessage
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.InetAddress
@@ -25,27 +27,22 @@ class PcscfDiscoveryTest {
     )
 
     @Test
-    fun testFallbackWhenNoExplicitFqdnOrDnsFails() = runBlocking {
+    fun testDiscoveryLifecycleStartsInDiscoveringState() {
         val provider = DefaultPcscfDiscoveryProvider()
+        // Must NOT initialize selected P-CSCF as STATIC_LEGACY before discovery
+        assertNull("Selected P-CSCF must be null before discovery runs", provider.selectedPcscf.value)
+        assertTrue("Initial state must be Discovering", provider.discoveryState.value is PcscfDiscoveryState.Discovering)
 
-        // Discovery with null or blank explicit FQDN must honest-fallback to legacy static endpoint
-        val selected = provider.discover(
-            network = null,
-            explicitPcscfFqdn = null,
-            legacyFallback = legacyFallback
-        )
-
-        assertNotNull(selected)
-        assertEquals("172.30.104.240", selected.host)
-        assertEquals(5060, selected.port)
-        assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.source)
-        assertTrue(selected.isFallback)
-        assertTrue(selected.statusDetail.contains("unavailable to this APK"))
-        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Fallback)
+        // Calling startDiscovery() resets to null and Discovering
+        provider.selectManualOverride(PcscfEndpoint(host = "10.0.0.1", port = 5060, source = PcscfDiscoverySource.MANUAL_OVERRIDE))
+        assertNotNull(provider.selectedPcscf.value)
+        provider.startDiscovery()
+        assertNull(provider.selectedPcscf.value)
+        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Discovering)
     }
 
     @Test
-    fun testDiscoverySuccessWithExplicitFqdnAndMockDns() = runBlocking {
+    fun testDiscoveryResultWinsOverStaticFallback() = runBlocking {
         val provider = DefaultPcscfDiscoveryProvider()
 
         // Inject mock DNS resolver returning an IP address for an explicit FQDN
@@ -63,12 +60,65 @@ class PcscfDiscoveryTest {
             legacyFallback = legacyFallback
         )
 
+        // Discovery result MUST win over static fallback
         assertNotNull(selected)
         assertEquals("172.22.0.21", selected.host)
         assertEquals(5060, selected.port)
         assertEquals(PcscfDiscoverySource.DNS_A_AAAA, selected.source)
-        assertFalse(selected.isFallback)
+        assertEquals(PcscfDiscoverySource.DNS_A_AAAA, selected.endpoint.source)
+        assertFalse("Must not be marked fallback when discovered via DNS", selected.isFallback)
         assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Discovered)
+        assertSameEndpointAndSource(selected)
+    }
+
+    @Test
+    fun testStaticFallbackSelectedOnlyAfterDiscoveryFailure() = runBlocking {
+        val provider = DefaultPcscfDiscoveryProvider()
+
+        // Explicit FQDN configured, but DNS returns no addresses (fails)
+        provider.dnsResolver = { _, _ -> emptyArray() }
+
+        val selected = provider.discover(
+            network = null,
+            explicitPcscfFqdn = "pcscf.nonexistent.domain",
+            legacyFallback = legacyFallback
+        )
+
+        assertNotNull(selected)
+        assertEquals("172.30.104.240", selected.host)
+        assertEquals(5060, selected.port)
+        assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.source)
+        assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.endpoint.source)
+        assertTrue("Must be marked fallback after discovery failure", selected.isFallback)
+        assertTrue(selected.statusDetail.contains("returned no addresses"))
+        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Fallback)
+        assertSameEndpointAndSource(selected)
+    }
+
+    @Test
+    fun testBlankFqdnDoesNotClaimDnsDiscovery() = runBlocking {
+        val provider = DefaultPcscfDiscoveryProvider()
+
+        // Blank or null FQDN MUST NOT claim DNS discovery
+        val testFqdns = listOf(null, "", "   ")
+        for (blankFqdn in testFqdns) {
+            val selected = provider.discover(
+                network = null,
+                explicitPcscfFqdn = blankFqdn,
+                legacyFallback = legacyFallback
+            )
+
+            assertNotNull(selected)
+            assertNotEquals("Blank FQDN must not claim DNS discovery", PcscfDiscoverySource.DNS_A_AAAA, selected.source)
+            assertEquals("172.30.104.240", selected.host)
+            assertEquals(5060, selected.port)
+            assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.source)
+            assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.endpoint.source)
+            assertTrue(selected.isFallback)
+            assertTrue("Status must clearly report no P-CSCF FQDN provisioned", selected.statusDetail.contains("no P-CSCF FQDN provisioned"))
+            assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Fallback)
+            assertSameEndpointAndSource(selected)
+        }
     }
 
     @Test
@@ -86,8 +136,16 @@ class PcscfDiscoveryTest {
         assertNotNull(selected)
         assertEquals("10.0.0.1", selected!!.host)
         assertEquals(PcscfDiscoverySource.MANUAL_OVERRIDE, selected.source)
+        assertEquals(PcscfDiscoverySource.MANUAL_OVERRIDE, selected.endpoint.source)
         assertFalse(selected.isFallback)
         assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Discovered)
+        assertSameEndpointAndSource(selected)
+    }
+
+    private fun assertSameEndpointAndSource(selected: com.example.sip.discovery.SelectedPcscf) {
+        assertEquals("Selected source must match selected endpoint source", selected.source, selected.endpoint.source)
+        assertEquals("Selected host must match endpoint host", selected.host, selected.endpoint.host)
+        assertEquals("Selected port must match endpoint port", selected.port, selected.endpoint.port)
     }
 
     @Test

@@ -143,15 +143,8 @@ class McpttSipStack(
     fun start(context: Context, initialProfile: SipProfile) {
         this.profile = initialProfile
 
-        // Seed initial P-CSCF state with legacy static fallback immediately
-        pcscfDiscoveryProvider.selectManualOverride(
-            PcscfEndpoint(
-                host = initialProfile.pcscfHost,
-                port = initialProfile.pcscfPort,
-                transport = initialProfile.transport,
-                source = PcscfDiscoverySource.STATIC_LEGACY
-            )
-        )
+        // Initiate P-CSCF discovery lifecycle (DISCOVERING -> Discovered or Fallback)
+        pcscfDiscoveryProvider.startDiscovery()
 
         val netMgr = McpttApnNetworkManager(context.applicationContext, scope)
         this.apnManager = netMgr
@@ -215,7 +208,22 @@ class McpttSipStack(
                             _registrationState.value = RegistrationState.MCPTT_APN_BOUND
                         }
                     }
-                    is ApnNetworkStatus.Disconnected -> {
+                    is ApnNetworkStatus.Disconnected, is ApnNetworkStatus.NoMcpttPdn -> {
+                        if (selectedPcscf.value == null) {
+                            scope.launch {
+                                val legacyFallback = PcscfEndpoint(
+                                    host = profile.pcscfHost,
+                                    port = profile.pcscfPort,
+                                    transport = profile.transport,
+                                    source = PcscfDiscoverySource.STATIC_LEGACY
+                                )
+                                pcscfDiscoveryProvider.discover(
+                                    network = null,
+                                    explicitPcscfFqdn = profile.pcscfFqdn.ifBlank { null },
+                                    legacyFallback = legacyFallback
+                                )
+                            }
+                        }
                         if (_registrationState.value != RegistrationState.REGISTERED) {
                             _registrationState.value = RegistrationState.NETWORK_UNAVAILABLE
                         }
@@ -229,6 +237,19 @@ class McpttSipStack(
             scope.launch {
                 // Wait briefly for network / acquisition or proceed with fallback
                 delay(1200)
+                if (selectedPcscf.value == null) {
+                    val legacyFallback = PcscfEndpoint(
+                        host = profile.pcscfHost,
+                        port = profile.pcscfPort,
+                        transport = profile.transport,
+                        source = PcscfDiscoverySource.STATIC_LEGACY
+                    )
+                    pcscfDiscoveryProvider.discover(
+                        network = apnManager?.activeNetwork,
+                        explicitPcscfFqdn = profile.pcscfFqdn.ifBlank { null },
+                        legacyFallback = legacyFallback
+                    )
+                }
                 register()
             }
         }
@@ -250,6 +271,7 @@ class McpttSipStack(
 
         // Re-run acquisition with updated legacy fallback / FQDN
         scope.launch {
+            pcscfDiscoveryProvider.startDiscovery()
             val legacyFallback = PcscfEndpoint(
                 host = newProfile.pcscfHost,
                 port = newProfile.pcscfPort,
