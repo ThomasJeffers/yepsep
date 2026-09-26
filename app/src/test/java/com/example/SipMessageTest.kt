@@ -122,4 +122,56 @@ class SipMessageTest {
         assertEquals("sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:6060;lr", routeSet[0])
         assertEquals("sip:172.22.0.21:5060;lr", routeSet[1])
     }
+
+    @Test
+    fun testExtractSdpMediaFromPureSdpBody() {
+        val sdpBodyOnly = """
+            v=0
+            o=mcptt-server 1727350343491 1 IN IP4 172.30.104.240
+            s=MCPTT-Mock
+            c=IN IP4 172.30.104.240
+            t=0 0
+            m=audio 10002 RTP/AVP 0
+            a=rtpmap:0 PCMU/8000
+            a=rtcp:10003 IN IP4 172.30.104.240
+            a=sendrecv
+            a=mcptt
+        """.trimIndent()
+
+        val (ip, port) = SipMessage.extractSdpMediaFromText(sdpBodyOnly)
+        assertEquals("172.30.104.240", ip)
+        assertEquals(10002, port)
+
+        val summary = SipMessage.extractSdpMediaSummary(sdpBodyOnly)
+        assertEquals("172.30.104.240:10002", summary)
+    }
+
+    @Test
+    fun testSipStackNegotiatedMediaDoesNotFallbackToSipPort() {
+        val stack = com.example.sip.engine.McpttSipStack()
+        val sdpBody = """
+            v=0
+            o=mcptt-server 1234 1 IN IP4 172.30.104.240
+            s=MCPTT
+            c=IN IP4 172.30.104.240
+            t=0 0
+            m=audio 10002 RTP/AVP 0
+            a=rtpmap:0 PCMU/8000
+        """.trimIndent()
+
+        val raw200Ok = "SIP/2.0 200 OK\r\n" +
+                "CSeq: 100 INVITE\r\n" +
+                "Call-ID: call-test-123\r\n" +
+                "Content-Type: application/sdp\r\n" +
+                "Content-Length: ${sdpBody.length}\r\n\r\n" +
+                sdpBody
+
+        stack.processIncomingSipPacket(raw200Ok)
+        val media = stack.negotiatedMedia.value
+        org.junit.Assert.assertNotNull("NegotiatedMedia must not be null after 200 OK with SDP", media)
+        assertEquals("172.30.104.240", media?.host)
+        assertEquals(10002, media?.rtpPort)
+        // Must NEVER be the SIP AS port 5070
+        org.junit.Assert.assertNotEquals(5070, media?.rtpPort)
+    }
 }

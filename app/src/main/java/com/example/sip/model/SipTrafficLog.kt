@@ -27,5 +27,6 @@ data class SipTrafficLog(
     val summary: String,
     val rawPacket: String,
     val isMcpttTagged: Boolean = false,
-    val hasError: Boolean = false
+    val hasError: Boolean = false,
+    val negotiatedMedia: String? = null
 )

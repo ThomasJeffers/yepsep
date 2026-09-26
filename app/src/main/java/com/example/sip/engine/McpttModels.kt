@@ -31,6 +31,7 @@ enum class FloorState {
 data class NegotiatedMedia(
     val host: String,
     val rtpPort: Int,
+    val rtcpPort: Int = rtpPort + 1,
     val codec: String = "PCMU/8000"
 )
 

@@ -453,7 +453,8 @@ class McpttSipStack(
                         activeRouteSet = msg.extractUacRouteSet()
 
                         // Extract SDP media information
-                        applySdpAnswer(msg.body)
+                        val sdpText = if (msg.body.contains("m=audio")) msg.body else msg.rawText
+                        applySdpAnswer(sdpText)
 
                         // Send ACK following dialog state
                         sendAck(msg)
@@ -468,8 +469,9 @@ class McpttSipStack(
                         }
                     }
                     msg.statusCode in 100..199 -> {
-                        if (msg.body.contains("m=audio")) {
-                            applySdpAnswer(msg.body)
+                        val sdpText = if (msg.body.contains("m=audio")) msg.body else if (msg.rawText.contains("m=audio")) msg.rawText else ""
+                        if (sdpText.isNotEmpty()) {
+                            applySdpAnswer(sdpText)
                         }
                         _callState.value = CallSessionState.CALLING
                         Log.i(TAG, "SIP INVITE ${msg.statusCode} ${msg.statusText} (Session Progress)")
@@ -513,7 +515,8 @@ class McpttSipStack(
                 activeRemoteTargetUri = msg.extractContactUri().ifEmpty { msg.from }
                 activeRouteSet = msg.extractUacRouteSet()
 
-                applySdpAnswer(msg.body)
+                val sdpText = if (msg.body.contains("m=audio")) msg.body else msg.rawText
+                applySdpAnswer(sdpText)
                 send200OkForInvite(msg, packetSourceHost, packetSourcePort)
             }
             "INFO" -> {
@@ -571,18 +574,46 @@ class McpttSipStack(
     }
 
     private fun applySdpAnswer(sdp: String) {
-        val (ip, port) = SipMessage.parse(sdp).extractSdpMedia()
+        val (ip, port) = SipMessage.extractSdpMediaFromText(sdp)
+        if (ip == null && port == null) {
+            Log.w(TAG, "applySdpAnswer: no SDP media found in input (${sdp.take(60)})")
+            return
+        }
         val host = ip ?: profile.mcpttAsHost
-        val rtpPort = port ?: profile.mcpttAsPort
+        val rtpPort = port
+        if (rtpPort == null || rtpPort <= 0) {
+            Log.e(TAG, "applySdpAnswer: missing or invalid audio port ($rtpPort)! DO NOT route to SIP port.")
+            logSystemEvent("SDP answer missing audio port (m=audio) — RTP audio failed", isError = true)
+            return
+        }
+
+        var rtcpPort: Int? = null
+        for (rawLine in sdp.lines()) {
+            val line = rawLine.trim()
+            if (line.startsWith("a=rtcp:", ignoreCase = true)) {
+                val portPart = line.substring(7).trim().split(Regex("\\s+")).firstOrNull()
+                rtcpPort = portPart?.toIntOrNull()
+            }
+        }
+
         val media = NegotiatedMedia(
             host = host,
             rtpPort = rtpPort,
+            rtcpPort = rtcpPort ?: (rtpPort + 1),
             codec = "PCMU/8000"
         )
         _negotiatedMedia.value = media
         remoteMediaIp = host
-        remoteMediaPort = port
+        remoteMediaPort = rtpPort
         Log.i(TAG, "Negotiated media: $media")
+        logSystemEvent(
+            "SDP answer media → ${media.host}:${media.rtpPort}",
+            mediaInfo = "${media.host}:${media.rtpPort}"
+        )
+        logSystemEvent(
+            "=== SDP ANSWER ===\nLOCAL ${getLocalIpAddress()}:${_localRtpPort.value}\nREMOTE ${media.host}:${media.rtpPort}\n$sdp",
+            mediaInfo = "${media.host}:${media.rtpPort}"
+        )
         onMediaNegotiated?.invoke(host, rtpPort)
     }
 
@@ -733,6 +764,11 @@ class McpttSipStack(
             append("a=sendrecv\r\n")
             append("a=mcptt\r\n")
         }
+
+        logSystemEvent(
+            "=== SDP OFFER ===\nLOCAL $localIp SIP:${profile.localSipPort} RTP:$rtpPortToOffer\n$sdpBody",
+            mediaInfo = "$localIp:$rtpPortToOffer"
+        )
 
         val routeHeader = if (profile.scscfOrigRoute.isNotBlank()) {
             "Route: <${profile.scscfOrigRoute.trim()}>\r\n"
@@ -1176,6 +1212,10 @@ class McpttSipStack(
                         firstLine.startsWith("SIP/2.0 6")
                 )
 
+        val sdpMedia = if (rawText.contains("m=audio")) {
+            SipMessage.extractSdpMediaSummary(rawText)
+        } else null
+
         val log = SipTrafficLog(
             timestamp = System.currentTimeMillis(),
             direction = direction,
@@ -1185,9 +1225,27 @@ class McpttSipStack(
             summary = firstLine,
             rawPacket = rawText,
             isMcpttTagged = isMcptt,
-            hasError = hasErr
+            hasError = hasErr,
+            negotiatedMedia = sdpMedia
         )
         scope.launch {
+            _trafficLogs.emit(log)
+        }
+    }
+
+    fun logSystemEvent(msg: String, isError: Boolean = false, mediaInfo: String? = null) {
+        scope.launch {
+            val log = SipTrafficLog(
+                timestamp = System.currentTimeMillis(),
+                direction = LogDirection.INBOUND,
+                type = LogType.SYSTEM_EVENT,
+                methodOrResponse = if (isError) "ERROR" else "INFO",
+                remoteAddress = "Local Engine",
+                summary = msg.lines().firstOrNull() ?: msg,
+                rawPacket = msg,
+                hasError = isError,
+                negotiatedMedia = mediaInfo
+            )
             _trafficLogs.emit(log)
         }
     }

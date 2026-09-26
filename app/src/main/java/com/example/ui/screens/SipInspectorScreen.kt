@@ -74,6 +74,15 @@ fun SipInspectorScreen(viewModel: McpttViewModel) {
     val context = LocalContext.current
     val logs by viewModel.filteredLogs.collectAsState()
     val currentFilter by viewModel.logFilter.collectAsState()
+    val profile by viewModel.sipProfile.collectAsState()
+    val selectedPcscf by viewModel.selectedPcscf.collectAsState()
+    val negotiatedMedia by viewModel.negotiatedMedia.collectAsState()
+    val boundRtpPort by viewModel.boundRtpPort.collectAsState()
+    val callState by viewModel.callState.collectAsState()
+    val rtpTxCount by viewModel.rtpTxCount.collectAsState()
+    val rtpRxCount by viewModel.rtpRxCount.collectAsState()
+    val apnNetworkStatus by viewModel.apnNetworkStatus.collectAsState()
+    val localIp = viewModel.sipStack.getLocalIpAddress()
 
     Column(
         modifier = Modifier
@@ -93,6 +102,21 @@ fun SipInspectorScreen(viewModel: McpttViewModel) {
             text = "Monitors raw SIP datagrams sent/received with +g.3gpp.mcptt headers",
             fontSize = 11.sp,
             color = HighDensityTextSecondary
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // MEDIA & ENDPOINTS STATUS CARD
+        MediaEndpointCard(
+            mode = selectedPcscf?.summary() ?: profile.sipDestinationLabel(),
+            localSip = "$localIp:${profile.localSipPort}",
+            localRtp = "$localIp:$boundRtpPort",
+            remoteSip = selectedPcscf?.endpoint?.toHostPort() ?: "${profile.sipDestinationHost()}:${profile.sipDestinationPort()}",
+            remoteRtp = negotiatedMedia?.let { "${it.host}:${it.rtpPort}" } ?: "—",
+            network = apnNetworkStatus.displaySummary(),
+            callState = callState.name,
+            rtpTx = rtpTxCount,
+            rtpRx = rtpRxCount
         )
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -291,6 +315,28 @@ fun SipPacketCard(log: SipTrafficLog, onCopy: (String) -> Unit) {
                 }
             }
 
+            val mediaText = log.negotiatedMedia ?: if (log.rawPacket.contains("m=audio")) {
+                com.example.sip.model.SipMessage.extractSdpMediaSummary(log.rawPacket)
+            } else null
+
+            if (!mediaText.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Color(0xFF16A34A).copy(alpha = 0.12f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = "Negotiated Media: $mediaText",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF15803D),
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
             // EXPANDED RAW SIP TEXT VIEWER
             if (expanded) {
                 Spacer(modifier = Modifier.height(8.dp))
@@ -334,6 +380,34 @@ fun SipPacketCard(log: SipTrafficLog, onCopy: (String) -> Unit) {
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun MediaEndpointCard(
+    mode: String,
+    localSip: String,
+    localRtp: String,
+    remoteSip: String,
+    remoteRtp: String,
+    network: String,
+    callState: String,
+    rtpTx: Long,
+    rtpRx: Long
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = HighDensityNavy),
+        shape = RoundedCornerShape(10.dp)
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Text("ENDPOINTS & NEGOTIATED MEDIA", fontSize = 10.sp, color = Color.White.copy(0.7f), fontFamily = FontFamily.Monospace)
+            Text(mode, fontSize = 11.sp, color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+            Text("Net  $network", fontSize = 11.sp, color = Color.White.copy(0.9f), fontFamily = FontFamily.Monospace)
+            Text("SIP  local $localSip    remote $remoteSip", fontSize = 11.sp, color = Color.White, fontFamily = FontFamily.Monospace)
+            Text("RTP  local $localRtp    remote $remoteRtp", fontSize = 11.sp, color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+            Text("Call $callState    RTP TX $rtpTx  RX $rtpRx", fontSize = 11.sp, color = Color(0xFF4ADE80), fontFamily = FontFamily.Monospace)
         }
     }
 }

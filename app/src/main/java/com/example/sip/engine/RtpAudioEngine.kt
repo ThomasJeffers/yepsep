@@ -520,19 +520,20 @@ class RtpAudioEngine {
             am.isSpeakerphoneOn = true
 
             // Maximize volume for both media and voice streams so PTT is always audible
+            val stream = AudioManager.STREAM_VOICE_CALL
+            val max = am.getStreamMaxVolume(stream)
+            if (max > 0) {
+                am.setStreamVolume(stream, max, 0)
+            }
             val musicMax = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             val currentMusic = am.getStreamVolume(AudioManager.STREAM_MUSIC)
             if (musicMax > 0 && currentMusic < (musicMax * 0.75f)) {
                 am.setStreamVolume(AudioManager.STREAM_MUSIC, (musicMax * 0.9f).toInt().coerceAtLeast(1), 0)
             }
-            val voiceMax = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-            if (voiceMax > 0) {
-                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, voiceMax, 0)
-            }
 
             if (Build.VERSION.SDK_INT >= 26) {
                 val attrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
                 val req = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -541,7 +542,7 @@ class RtpAudioEngine {
                 am.requestAudioFocus(req)
             } else {
                 @Suppress("DEPRECATION")
-                am.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+                am.requestAudioFocus(null, stream, AudioManager.AUDIOFOCUS_GAIN)
             }
             synchronized(trackLock) {
                 audioTrack?.setVolume(1.0f)
@@ -556,7 +557,7 @@ class RtpAudioEngine {
         val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )

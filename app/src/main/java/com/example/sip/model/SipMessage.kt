@@ -101,31 +101,56 @@ data class SipMessage(
     }
 
     fun extractSdpMedia(): Pair<String?, Int?> {
-        var remoteIp: String? = null
-        var remotePort: Int? = null
-
-        val lines = body.lines()
-        for (line in lines) {
-            val trimmed = line.trim()
-            if (trimmed.startsWith("c=IN IP4 ")) {
-                val ip = trimmed.removePrefix("c=IN IP4 ").trim()
-                if (ip.isNotEmpty()) {
-                    remoteIp = ip
-                }
-            } else if (trimmed.startsWith("m=audio ")) {
-                val parts = trimmed.split(" ")
-                if (parts.size >= 2) {
-                    val port = parts[1].toIntOrNull()
-                    if (port != null && port > 0) {
-                        remotePort = port
-                    }
-                }
-            }
+        val sdpContent = if (body.contains("m=audio")) {
+            body
+        } else if (rawText.contains("m=audio")) {
+            val idx = rawText.indexOf("v=0")
+            if (idx >= 0) rawText.substring(idx) else rawText
+        } else {
+            ""
         }
-        return Pair(remoteIp, remotePort)
+        return extractSdpMediaFromText(sdpContent)
     }
 
     companion object {
+        fun extractSdpMediaFromText(sdpText: String): Pair<String?, Int?> {
+            if (sdpText.isBlank() || !sdpText.contains("m=audio")) {
+                return Pair(null, null)
+            }
+            var text = sdpText
+            val v0 = text.indexOf("v=0")
+            if (v0 >= 0) {
+                text = text.substring(v0)
+            }
+            var remoteIp: String? = null
+            var remotePort: Int? = null
+
+            for (rawLine in text.lines()) {
+                val trimmed = rawLine.trim()
+                if (trimmed.startsWith("c=IN IP4 ", ignoreCase = true)) {
+                    val ip = trimmed.substring(9).trim().substringBefore(" ")
+                    if (ip.isNotEmpty()) {
+                        remoteIp = ip
+                    }
+                } else if (trimmed.startsWith("m=audio ", ignoreCase = true)) {
+                    val parts = trimmed.split(Regex("\\s+"))
+                    if (parts.size >= 2) {
+                        val port = parts[1].toIntOrNull()
+                        if (port != null && port > 0) {
+                            remotePort = port
+                        }
+                    }
+                }
+            }
+            return Pair(remoteIp, remotePort)
+        }
+
+        fun extractSdpMediaSummary(rawTextOrSdp: String): String? {
+            val (ip, port) = extractSdpMediaFromText(rawTextOrSdp)
+            return if (port != null) {
+                if (ip != null) "$ip:$port" else ":$port"
+            } else null
+        }
         fun parse(rawText: String): SipMessage {
             val lines = rawText.lines()
             if (lines.isEmpty()) {
