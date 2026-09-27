@@ -13,7 +13,7 @@ enum class PcscfDiscoveryMethod(val displayName: String) {
  *
  * Supports two selectable discovery methods:
  * 1. PRECONFIGURED:
- *    - Preconfigured host (IPv4 literal e.g. 172.22.0.21 or FQDN)
+ *    - Preconfigured host (IPv4 literal or FQDN provisioned via runtime configuration)
  *    - Configurable port (default 5060)
  *    - Transport (default UDP)
  * 2. NETWORK_DNS:
@@ -23,7 +23,7 @@ enum class PcscfDiscoveryMethod(val displayName: String) {
  */
 data class PcscfConfig(
     val method: PcscfDiscoveryMethod = PcscfDiscoveryMethod.PRECONFIGURED,
-    val preconfiguredHost: String = "172.22.0.21",
+    val preconfiguredHost: String = "",
     val preconfiguredPort: Int = 5060,
     val dnsFqdn: String = "pcscf.ims.mnc070.mcc901.3gppnetwork.org",
     val dnsPort: Int = 5060,

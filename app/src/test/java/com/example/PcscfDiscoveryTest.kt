@@ -1,5 +1,7 @@
 package com.example
 
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
 import com.example.sip.discovery.DefaultPcscfDiscoveryProvider
 import com.example.sip.discovery.PcscfConfig
 import com.example.sip.discovery.PcscfDiscoveryMethod
@@ -7,9 +9,15 @@ import com.example.sip.discovery.PcscfDiscoverySource
 import com.example.sip.discovery.PcscfDiscoveryState
 import com.example.sip.discovery.PcscfEndpoint
 import com.example.sip.discovery.SelectedPcscf
+import com.example.sip.engine.McpttSipStack
+import com.example.sip.engine.RegistrationState
 import com.example.sip.engine.SipDestination
 import com.example.sip.engine.SipNextHopResolver
 import com.example.sip.model.SipMessage
+import com.example.sip.model.SipProfile
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -18,8 +26,14 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicInteger
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
 class PcscfDiscoveryTest {
 
     private val testConfig = PcscfConfig(
@@ -332,5 +346,151 @@ class PcscfDiscoveryTest {
         assertEquals("172.22.0.21", dest.host)
         assertEquals(5060, dest.port)
         assertEquals("172.22.0.21:5060", dest.toHostPort())
+    }
+
+    @Test
+    fun testSingleFlightConcurrentDiscovery() = runBlocking {
+        val provider = DefaultPcscfDiscoveryProvider()
+        val resolverCalls = AtomicInteger(0)
+
+        provider.dnsResolver = { _, fqdn ->
+            resolverCalls.incrementAndGet()
+            delay(50) // simulate resolution time
+            arrayOf(InetAddress.getByName("172.22.0.21"))
+        }
+
+        val dnsConfig = PcscfConfig(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            preconfiguredHost = "",
+            dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
+        )
+
+        // Launch 5 concurrent discovery requests
+        val jobs = (1..5).map {
+            async {
+                provider.discover(
+                    method = PcscfDiscoveryMethod.NETWORK_DNS,
+                    config = dnsConfig,
+                    network = null
+                )
+            }
+        }
+
+        val results = jobs.awaitAll()
+        assertEquals(5, results.size)
+        // All jobs return identical discovered endpoint
+        results.forEach { res ->
+            assertEquals("172.22.0.21", res.host)
+            assertEquals(PcscfDiscoverySource.DNS_RESOLVED, res.source)
+        }
+        // Single-flight: exactly 1 actual DNS resolver execution occurred
+        assertEquals(1, resolverCalls.get())
+    }
+
+    @Test
+    fun testIdempotentDiscovery() = runBlocking {
+        val provider = DefaultPcscfDiscoveryProvider()
+        val resolverCalls = AtomicInteger(0)
+
+        provider.dnsResolver = { _, _ ->
+            resolverCalls.incrementAndGet()
+            arrayOf(InetAddress.getByName("172.22.0.21"))
+        }
+
+        val dnsConfig = PcscfConfig(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            preconfiguredHost = "",
+            dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
+        )
+
+        val res1 = provider.discover(PcscfDiscoveryMethod.NETWORK_DNS, dnsConfig, null)
+        val res2 = provider.discover(PcscfDiscoveryMethod.NETWORK_DNS, dnsConfig, null)
+
+        assertEquals("172.22.0.21", res1.host)
+        assertEquals("172.22.0.21", res2.host)
+        assertEquals(1, resolverCalls.get())
+    }
+
+    @Test
+    fun testDnsFailureWithoutFallbackHostReportsErrorAndNoSelectedEndpoint() = runBlocking {
+        val provider = DefaultPcscfDiscoveryProvider()
+        provider.dnsResolver = { _, _ -> emptyArray() } // DNS fails
+
+        val dnsConfig = PcscfConfig(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            preconfiguredHost = "", // No preconfigured fallback
+            dnsFqdn = "pcscf.nonexistent.fqdn"
+        )
+
+        val res = provider.discover(PcscfDiscoveryMethod.NETWORK_DNS, dnsConfig, null)
+        assertEquals(PcscfDiscoverySource.ERROR, res.source)
+        assertFalse(res.isFallback)
+        assertNotNull(res.failureReason)
+        assertNull("Selected P-CSCF must be null when discovery fails without fallback", provider.selectedPcscf.value)
+        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.DnsFailed)
+    }
+
+    @Test
+    fun testRegisterRejectsWhileDiscovering() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val stack = McpttSipStack()
+        val sentPackets = mutableListOf<String>()
+        stack.onPacketSent = { rawSip, _, _ -> sentPackets.add(rawSip) }
+
+        val profile = SipProfile(
+            pcscfConfig = PcscfConfig(
+                method = PcscfDiscoveryMethod.NETWORK_DNS,
+                dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org",
+                preconfiguredHost = ""
+            ),
+            autoRegister = false
+        )
+
+        stack.start(context, profile)
+        assertTrue("Stack discoveryState must be Discovering", stack.pcscfDiscoveryState.value is PcscfDiscoveryState.Discovering)
+
+        // Attempting to send REGISTER while DISCOVERING must be rejected immediately
+        stack.register()
+        assertEquals("No SIP packet must be sent while discovery is DISCOVERING", 0, sentPackets.size)
+        assertNotEquals(RegistrationState.REGISTERING, stack.registrationState.value)
+
+        stack.stop()
+    }
+
+    @Test
+    fun testRegisterRejectsWhenDiscoveryFailedWithNoFallback() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val stack = McpttSipStack()
+        val sentPackets = mutableListOf<String>()
+        stack.onPacketSent = { rawSip, _, _ -> sentPackets.add(rawSip) }
+
+        val profile = SipProfile(
+            pcscfConfig = PcscfConfig(
+                method = PcscfDiscoveryMethod.NETWORK_DNS,
+                dnsFqdn = "pcscf.failed.fqdn",
+                preconfiguredHost = "" // No fallback
+            ),
+            autoRegister = false
+        )
+
+        stack.start(context, profile)
+
+        // Mock DNS failure on stack's discovery provider
+        (stack.pcscfDiscoveryProvider as DefaultPcscfDiscoveryProvider).dnsResolver = { _, _ -> emptyArray() }
+        stack.pcscfDiscoveryProvider.discover(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            config = profile.effectivePcscfConfig,
+            network = null
+        )
+
+        assertNull(stack.selectedPcscf.value)
+
+        // Attempting to register when no valid P-CSCF endpoint was discovered must fail
+        stack.register()
+        assertEquals(0, sentPackets.size)
+        assertEquals(RegistrationState.REGISTRATION_FAILED, stack.registrationState.value)
+        assertNotNull(stack.registrationFailureReason.value)
+
+        stack.stop()
     }
 }

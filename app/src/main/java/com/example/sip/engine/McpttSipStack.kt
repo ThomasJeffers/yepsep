@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Network
 import android.util.Log
 import com.example.sip.discovery.DefaultPcscfDiscoveryProvider
+import com.example.sip.discovery.PcscfConfig
 import com.example.sip.discovery.PcscfDiscoveryMethod
 import com.example.sip.discovery.PcscfDiscoveryProvider
 import com.example.sip.discovery.PcscfDiscoverySource
@@ -17,6 +18,7 @@ import com.example.sip.model.SipProfile
 import com.example.sip.model.SipTrafficLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -27,6 +29,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -95,6 +99,13 @@ class McpttSipStack(
     val selectedPcscf: StateFlow<SelectedPcscf?> = pcscfDiscoveryProvider.selectedPcscf
     val pcscfDiscoveryState: StateFlow<PcscfDiscoveryState> = pcscfDiscoveryProvider.discoveryState
 
+    // Single-flight discovery state
+    private val discoveryMutex = Mutex()
+    private var inFlightDiscoveryJob: Job? = null
+    private var lastDiscoveredNetwork: Network? = null
+    private var lastDiscoveredConfig: com.example.sip.discovery.PcscfConfig? = null
+    private var lastRegisteredEndpoint: PcscfEndpoint? = null
+
     /**
      * Authoritative P-CSCF host for initial/out-of-dialog IMS requests.
      */
@@ -153,16 +164,11 @@ class McpttSipStack(
         this.apnManager = netMgr
         netMgr.updateConfig(initialProfile.apnName, initialProfile.apnPrefix)
 
-        // If PRECONFIGURED method is selected, discover preconfigured endpoint immediately
+        // If PRECONFIGURED method is selected, discover preconfigured endpoint immediately if literal
         if (initialProfile.effectivePcscfConfig.method == PcscfDiscoveryMethod.PRECONFIGURED) {
-            scope.launch {
-                val dnsServers = netMgr.getDnsServers(netMgr.activeNetwork)
-                pcscfDiscoveryProvider.discover(
-                    method = PcscfDiscoveryMethod.PRECONFIGURED,
-                    config = initialProfile.effectivePcscfConfig,
-                    network = netMgr.activeNetwork,
-                    dnsServers = dnsServers
-                )
+            val rawHost = initialProfile.effectivePcscfConfig.preconfiguredHost.trim()
+            if (rawHost.isNotEmpty() && (PcscfConfig.isIpv4Literal(rawHost) || rawHost.contains(":"))) {
+                pcscfDiscoveryProvider.selectPreconfiguredImmediately(initialProfile.effectivePcscfConfig)
             }
         }
 
@@ -204,35 +210,17 @@ class McpttSipStack(
                             }
                         }
 
-                        // Trigger P-CSCF acquisition over the bound cellular network
-                        scope.launch {
-                            val dnsServers = netMgr.getDnsServers(netMgr.activeNetwork)
-                            pcscfDiscoveryProvider.discover(
-                                method = profile.effectivePcscfConfig.method,
-                                config = profile.effectivePcscfConfig,
-                                network = netMgr.activeNetwork,
-                                dnsServers = dnsServers
-                            )
-                        }
-
                         if (_registrationState.value == RegistrationState.UNREGISTERED ||
                             _registrationState.value == RegistrationState.NETWORK_UNAVAILABLE) {
                             _registrationState.value = RegistrationState.MCPTT_APN_BOUND
                         }
+
+                        // Trigger single-flight coordinated P-CSCF discovery & auto-registration
+                        triggerCoordinatedDiscovery(netMgr.activeNetwork)
                     }
                     is ApnNetworkStatus.Disconnected, is ApnNetworkStatus.NoMcpttPdn -> {
-                        if (selectedPcscf.value == null) {
-                            scope.launch {
-                                val dnsServers = netMgr.getDnsServers(null)
-                                pcscfDiscoveryProvider.discover(
-                                    method = profile.effectivePcscfConfig.method,
-                                    config = profile.effectivePcscfConfig,
-                                    network = null,
-                                    dnsServers = dnsServers
-                                )
-                            }
-                        }
-                        if (_registrationState.value != RegistrationState.REGISTERED) {
+                        lastDiscoveredNetwork = null
+                        if (_registrationState.value != RegistrationState.UNREGISTERED) {
                             _registrationState.value = RegistrationState.NETWORK_UNAVAILABLE
                         }
                     }
@@ -240,21 +228,70 @@ class McpttSipStack(
                 }
             }
         }
+    }
 
-        if (initialProfile.autoRegister) {
-            scope.launch {
-                // Wait briefly for network / acquisition or proceed with fallback
-                delay(1200)
-                if (selectedPcscf.value == null) {
-                    val dnsServers = apnManager?.getDnsServers(apnManager?.activeNetwork) ?: emptyList()
-                    pcscfDiscoveryProvider.discover(
-                        method = profile.effectivePcscfConfig.method,
-                        config = profile.effectivePcscfConfig,
-                        network = apnManager?.activeNetwork,
+    private fun triggerCoordinatedDiscovery(network: Network?) {
+        scope.launch {
+            discoveryMutex.withLock {
+                val currentConfig = profile.effectivePcscfConfig
+                val currentSelected = selectedPcscf.value
+
+                // If already resolved for this exact network and configuration, do not repeat discovery unnecessarily
+                val alreadyResolved = lastDiscoveredNetwork == network &&
+                        lastDiscoveredConfig == currentConfig &&
+                        currentSelected != null &&
+                        (currentSelected.source == PcscfDiscoverySource.DNS_RESOLVED ||
+                         currentSelected.source == PcscfDiscoverySource.PRECONFIGURED ||
+                         currentSelected.source == PcscfDiscoverySource.FALLBACK)
+
+                if (alreadyResolved) {
+                    Log.i(TAG, "P-CSCF already resolved for network $network: ${currentSelected?.endpoint?.toHostPort()}")
+                    if (profile.autoRegister && 
+                        _registrationState.value != RegistrationState.REGISTERED && 
+                        _registrationState.value != RegistrationState.REGISTERING) {
+                        register()
+                    }
+                    return@withLock
+                }
+
+                // If discovery is already in flight for this stack, do not launch a second discovery
+                if (inFlightDiscoveryJob?.isActive == true) {
+                    Log.i(TAG, "P-CSCF discovery already in flight; awaiting existing discovery job")
+                    inFlightDiscoveryJob?.join()
+                    if (profile.autoRegister && 
+                        _registrationState.value != RegistrationState.REGISTERED && 
+                        _registrationState.value != RegistrationState.REGISTERING) {
+                        register()
+                    }
+                    return@withLock
+                }
+
+                val job = launch {
+                    val dnsServers = apnManager?.getDnsServers(network) ?: emptyList()
+                    val result = pcscfDiscoveryProvider.discover(
+                        method = currentConfig.method,
+                        config = currentConfig,
+                        network = network,
                         dnsServers = dnsServers
                     )
+                    lastDiscoveredNetwork = network
+                    lastDiscoveredConfig = currentConfig
+                    Log.i(TAG, "P-CSCF discovery completed: result=${result.summary()} source=${result.source}")
+
+                    if (profile.autoRegister) {
+                        if (result.source == PcscfDiscoverySource.DNS_RESOLVED ||
+                            result.source == PcscfDiscoverySource.PRECONFIGURED ||
+                            (result.source == PcscfDiscoverySource.FALLBACK && result.isFallback)) {
+                            register()
+                        } else {
+                            Log.w(TAG, "Auto-register aborted: P-CSCF discovery failed with no valid fallback (${result.failureReason})")
+                            _registrationState.value = RegistrationState.REGISTRATION_FAILED
+                            _registrationFailureReason.value = "Discovery failed: ${result.failureReason}"
+                        }
+                    }
                 }
-                register()
+                inFlightDiscoveryJob = job
+                job.join()
             }
         }
     }
@@ -262,6 +299,7 @@ class McpttSipStack(
     fun updateProfile(context: Context, newProfile: SipProfile) {
         val portChanged = newProfile.localSipPort != profile.localSipPort
         val apnChanged = newProfile.apnName != profile.apnName || newProfile.apnPrefix != profile.apnPrefix
+        val configChanged = newProfile.effectivePcscfConfig != profile.effectivePcscfConfig
         this.profile = newProfile
 
         if (apnChanged) {
@@ -273,16 +311,30 @@ class McpttSipStack(
             recreateSocket()
         }
 
-        // Re-run discovery with updated configuration
-        scope.launch {
+        if (configChanged) {
+            lastDiscoveredConfig = null
+            lastDiscoveredNetwork = null
             pcscfDiscoveryProvider.startDiscovery(newProfile.effectivePcscfConfig.method)
-            val dnsServers = apnManager?.getDnsServers(apnManager?.activeNetwork) ?: emptyList()
-            pcscfDiscoveryProvider.discover(
-                method = newProfile.effectivePcscfConfig.method,
-                config = newProfile.effectivePcscfConfig,
-                network = apnManager?.activeNetwork,
-                dnsServers = dnsServers
-            )
+            if (newProfile.effectivePcscfConfig.method == PcscfDiscoveryMethod.PRECONFIGURED) {
+                val rawHost = newProfile.effectivePcscfConfig.preconfiguredHost.trim()
+                if (rawHost.isNotEmpty() && (PcscfConfig.isIpv4Literal(rawHost) || rawHost.contains(":"))) {
+                    pcscfDiscoveryProvider.selectPreconfiguredImmediately(newProfile.effectivePcscfConfig)
+                } else {
+                    triggerCoordinatedDiscovery(apnManager?.activeNetwork)
+                }
+            } else {
+                triggerCoordinatedDiscovery(apnManager?.activeNetwork)
+            }
+        }
+    }
+
+    fun setProfileForTest(newProfile: SipProfile) {
+        this.profile = newProfile
+        if (newProfile.effectivePcscfConfig.method == PcscfDiscoveryMethod.PRECONFIGURED) {
+            val rawHost = newProfile.effectivePcscfConfig.preconfiguredHost.trim()
+            if (rawHost.isNotEmpty()) {
+                pcscfDiscoveryProvider.selectPreconfiguredImmediately(newProfile.effectivePcscfConfig)
+            }
         }
     }
 
@@ -640,19 +692,48 @@ class McpttSipStack(
     }
 
     fun register() {
+        if (selectedPcscf.value == null &&
+            profile.effectivePcscfConfig.method == PcscfDiscoveryMethod.PRECONFIGURED &&
+            profile.effectivePcscfConfig.preconfiguredHost.isNotBlank()) {
+            pcscfDiscoveryProvider.selectPreconfiguredImmediately(profile.effectivePcscfConfig)
+        }
+
+        val discoveryStateValue = pcscfDiscoveryProvider.discoveryState.value
+        if (discoveryStateValue is PcscfDiscoveryState.Discovering) {
+            Log.w(TAG, "SIP REGISTER aborted: P-CSCF discovery is currently DISCOVERING")
+            return
+        }
+
+        val selected = selectedPcscf.value
+        if (selected == null || selected.source == PcscfDiscoverySource.ERROR ||
+            (selected.endpoint.resolvedIp.isNullOrBlank() && selected.endpoint.host.isBlank())) {
+            Log.e(TAG, "SIP REGISTER aborted: No valid P-CSCF endpoint selected by discovery")
+            _registrationState.value = RegistrationState.REGISTRATION_FAILED
+            _registrationFailureReason.value = "No valid P-CSCF endpoint selected by discovery (discovery failed or no fallback)"
+            return
+        }
+
+        // If already registered or actively registering to the identical endpoint, skip redundant registration
+        if (_registrationState.value == RegistrationState.REGISTERED && lastRegisteredEndpoint == selected.endpoint) {
+            Log.i(TAG, "SIP REGISTER skipped: already registered to endpoint ${selected.endpoint.toHostPort()}")
+            return
+        }
+
+        val dest = SipDestination(
+            host = selected.endpoint.effectiveHost,
+            port = selected.endpoint.port,
+            description = selected.summary()
+        )
+
         registerAuthAttempts = 0
         _registrationFailureReason.value = null
         _registrationState.value = RegistrationState.REGISTERING
         registerCallId = "reg-" + UUID.randomUUID().toString().replace("-", "").take(12) + "@" + profile.realm
         registerFromTag = "reg-" + UUID.randomUUID().toString().replace("-", "").take(8)
         registerCSeq = 1
+        lastRegisteredEndpoint = selected.endpoint
 
-        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
-            selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
-            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
-        )
-        Log.i(TAG, "REGISTER SEND via ${dest.description}:\n  callId=$registerCallId\n  cseq=$registerCSeq")
+        Log.i(TAG, "REGISTER SEND via ${dest.description}:\n  callId=$registerCallId\n  cseq=$registerCSeq dest=${dest.toHostPort()}")
         sendRegisterPacket(registerCSeq, authHeader = null, destination = dest)
     }
 
@@ -751,11 +832,16 @@ class McpttSipStack(
             opaque = opaque
         )
 
-        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
-            selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
-            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
-        )
+        val selected = selectedPcscf.value
+        val dest = if (selected != null && selected.source != PcscfDiscoverySource.ERROR) {
+            SipDestination(selected.endpoint.effectiveHost, selected.endpoint.port, selected.summary())
+        } else {
+            SipNextHopResolver.resolveOutOfDialogDestination(
+                selectedPcscf = selected,
+                fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+                fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
+            )
+        }
         sendRegisterPacket(registerCSeq, authHeaderValue, dest)
     }
 

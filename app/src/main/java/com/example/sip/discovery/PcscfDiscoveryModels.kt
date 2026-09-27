@@ -117,7 +117,7 @@ data class PcscfEndpoint(
 
     /**
      * Generates host:port representation with IPv6 bracket safety.
-     * E.g. [2001:db8::1]:5060 or 172.22.0.21:5060
+     * E.g. [2001:db8::1]:5060 or 192.168.102.20:5060
      */
     fun toHostPort(): String = "${formattedHostForUri()}:$port"
 }
@@ -179,7 +179,11 @@ sealed class PcscfDiscoveryState {
         override fun toString(): String = "DNS_RESOLVED"
     }
 
-    data class DnsFailed(val selected: SelectedPcscf, val reason: String, val fallbackEndpoint: PcscfEndpoint) : PcscfDiscoveryState() {
+    data class DnsFailed(
+        val selected: SelectedPcscf?,
+        val reason: String,
+        val fallbackEndpoint: PcscfEndpoint? = null
+    ) : PcscfDiscoveryState() {
         override fun toString(): String = "DNS_FAILED"
     }
 

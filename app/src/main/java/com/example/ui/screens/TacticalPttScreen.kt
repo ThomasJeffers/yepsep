@@ -245,20 +245,22 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                         } else {
                             val activePcscfText = when {
                                 pcscfDiscoveryState is PcscfDiscoveryState.Discovering -> {
-                                    selectedPcscf?.let { sel ->
-                                        "P-CSCF: ${sel.endpoint.toHostPort()} [DISCOVERING]"
-                                    } ?: "P-CSCF: [DISCOVERING]"
+                                    "P-CSCF: DISCOVERING..."
                                 }
                                 selectedPcscf != null -> {
                                     val sel = selectedPcscf!!
                                     if (sel.isFallback) {
                                         "P-CSCF: ${sel.endpoint.toHostPort()} [FALLBACK]"
                                     } else {
-                                        "P-CSCF: ${sel.endpoint.toHostPort()} [${sel.source.displayName}]"
+                                        "P-CSCF: ${sel.endpoint.toHostPort()}"
                                     }
                                 }
+                                pcscfDiscoveryState is PcscfDiscoveryState.DnsFailed ||
+                                pcscfDiscoveryState is PcscfDiscoveryState.Failed -> {
+                                    "P-CSCF: [DISCOVERY FAILED]"
+                                }
                                 else -> {
-                                    "P-CSCF: [DISCOVERING]"
+                                    "P-CSCF: DISCOVERING..."
                                 }
                             }
 
@@ -785,7 +787,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                     "2. Add or select APN with Name='mcptt', APN='mcptt', APN Type='default'.\n" +
                     "3. Set 'mcptt' as preferred active mobile data APN.\n" +
                     "4. Confirm UE IP is assigned from pool 192.168.102.x.\n" +
-                    "5. P-CSCF is acquired via explicit FQDN DNS or honest legacy static fallback (172.30.104.240:5060).",
+                    "5. P-CSCF is acquired via explicit FQDN DNS or runtime-configured preconfigured fallback.",
                     fontSize = 13.sp
                 )
             },

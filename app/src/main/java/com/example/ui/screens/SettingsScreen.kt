@@ -169,7 +169,6 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     displayName = "MCPTT UE-1"
                     mcpttId = "sip:491234567890123@ims.mnc070.mcc901.3gppnetwork.org"
                     pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED
-                    pcscfHost = "172.22.0.21"
                     pcscfPort = "5060"
                     pcscfFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
                     pcscfDnsPort = "5060"
@@ -179,7 +178,6 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     localRtpPort = "6000"
                     targetGroup = "sip:group1@ims.mnc070.mcc901.3gppnetwork.org"
                     scscfOrigRoute = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:5060;lr"
-                    asFallbackUri = "sip:172.30.104.240:5070;transport=udp"
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
                 border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
@@ -194,7 +192,6 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     displayName = "MCPTT UE-2"
                     mcpttId = "sip:491234567890124@ims.mnc070.mcc901.3gppnetwork.org"
                     pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED
-                    pcscfHost = "172.22.0.21"
                     pcscfPort = "5060"
                     pcscfFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
                     pcscfDnsPort = "5060"
@@ -204,7 +201,6 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     localRtpPort = "6004"
                     targetGroup = "sip:group1@ims.mnc070.mcc901.3gppnetwork.org"
                     scscfOrigRoute = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:5060;lr"
-                    asFallbackUri = "sip:172.30.104.240:5070;transport=udp"
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
                 border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),

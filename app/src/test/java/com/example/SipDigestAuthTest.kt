@@ -196,6 +196,7 @@ class SipDigestAuthTest {
             localSipPort = 5062,
             autoRegister = false
         )
+        stack.setProfileForTest(profile)
 
         // Inject initial unauthenticated REGISTER (REGISTER #1)
         stack.register()
@@ -284,6 +285,7 @@ class SipDigestAuthTest {
         stack.onPacketSent = { rawSip, _, _ ->
             sentPackets.add(rawSip)
         }
+        stack.setProfileForTest(com.example.sip.model.SipProfile(pcscfHost = "172.22.0.21", autoRegister = false))
 
         stack.register()
         assertEquals(1, sentPackets.size)
