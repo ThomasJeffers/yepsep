@@ -1,9 +1,12 @@
 package com.example
 
 import com.example.sip.discovery.DefaultPcscfDiscoveryProvider
+import com.example.sip.discovery.PcscfConfig
+import com.example.sip.discovery.PcscfDiscoveryMethod
 import com.example.sip.discovery.PcscfDiscoverySource
 import com.example.sip.discovery.PcscfDiscoveryState
 import com.example.sip.discovery.PcscfEndpoint
+import com.example.sip.discovery.SelectedPcscf
 import com.example.sip.engine.SipDestination
 import com.example.sip.engine.SipNextHopResolver
 import com.example.sip.model.SipMessage
@@ -19,79 +22,129 @@ import java.net.InetAddress
 
 class PcscfDiscoveryTest {
 
+    private val testConfig = PcscfConfig(
+        method = PcscfDiscoveryMethod.PRECONFIGURED,
+        preconfiguredHost = "172.22.0.21",
+        preconfiguredPort = 5060,
+        dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org",
+        dnsPort = 5060,
+        transport = "UDP"
+    )
+
     private val legacyFallback = PcscfEndpoint(
-        host = "172.30.104.240",
+        host = "172.22.0.21",
         port = 5060,
+        resolvedIp = "172.22.0.21",
         transport = "UDP",
-        source = PcscfDiscoverySource.STATIC_LEGACY
+        source = PcscfDiscoverySource.PRECONFIGURED
     )
 
     @Test
     fun testDiscoveryLifecycleStartsInDiscoveringState() {
         val provider = DefaultPcscfDiscoveryProvider()
-        // Must NOT initialize selected P-CSCF as STATIC_LEGACY before discovery
+        // Must NOT initialize selected P-CSCF as STATIC_LEGACY/FALLBACK before discovery
         assertNull("Selected P-CSCF must be null before discovery runs", provider.selectedPcscf.value)
         assertTrue("Initial state must be Discovering", provider.discoveryState.value is PcscfDiscoveryState.Discovering)
 
         // Calling startDiscovery() resets to null and Discovering
         provider.selectManualOverride(PcscfEndpoint(host = "10.0.0.1", port = 5060, source = PcscfDiscoverySource.MANUAL_OVERRIDE))
         assertNotNull(provider.selectedPcscf.value)
-        provider.startDiscovery()
+        provider.startDiscovery(PcscfDiscoveryMethod.NETWORK_DNS)
         assertNull(provider.selectedPcscf.value)
         assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Discovering)
+        assertEquals("DISCOVERING", provider.discoveryState.value.toString())
     }
 
     @Test
-    fun testDiscoveryResultWinsOverStaticFallback() = runBlocking {
+    fun testPreconfiguredDiscoveryMethod() = runBlocking {
         val provider = DefaultPcscfDiscoveryProvider()
 
-        // Inject mock DNS resolver returning an IP address for an explicit FQDN
+        val selected = provider.discover(
+            method = PcscfDiscoveryMethod.PRECONFIGURED,
+            config = testConfig,
+            network = null,
+            dnsServers = listOf("192.168.102.1")
+        )
+
+        assertNotNull(selected)
+        assertEquals("172.22.0.21", selected.host)
+        assertEquals(5060, selected.port)
+        assertEquals(PcscfDiscoverySource.PRECONFIGURED, selected.source)
+        assertEquals(PcscfDiscoverySource.PRECONFIGURED, selected.endpoint.source)
+        assertFalse("Preconfigured must not be marked as fallback", selected.isFallback)
+        assertEquals(PcscfDiscoveryMethod.PRECONFIGURED, selected.discoveryMethod)
+        assertEquals("172.22.0.21", selected.configuredHost)
+        assertEquals("172.22.0.21", selected.resolvedAddress)
+        assertEquals("172.22.0.21:5060", selected.endpoint.toHostPort())
+        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Preconfigured)
+        assertEquals("PRECONFIGURED", provider.discoveryState.value.toString())
+        assertSameEndpointAndSource(selected)
+    }
+
+    @Test
+    fun testNetworkDnsDiscoveryResultWinsOverPreconfiguredFallback() = runBlocking {
+        val provider = DefaultPcscfDiscoveryProvider()
+
+        // Inject mock DNS resolver simulating cellular Network DNS resolution for the FQDN
         provider.dnsResolver = { _, fqdn ->
-            if (fqdn == "pcscf.ims.custom.org") {
+            if (fqdn == "pcscf.ims.mnc070.mcc901.3gppnetwork.org") {
                 arrayOf(InetAddress.getByName("172.22.0.21"))
             } else {
                 emptyArray()
             }
         }
 
+        val dnsConfig = testConfig.copy(method = PcscfDiscoveryMethod.NETWORK_DNS)
         val selected = provider.discover(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            config = dnsConfig,
             network = null,
-            explicitPcscfFqdn = "pcscf.ims.custom.org",
-            legacyFallback = legacyFallback
+            dnsServers = listOf("192.168.102.1")
         )
 
-        // Discovery result MUST win over static fallback
+        // Discovered IP (172.22.0.21) wins over fallback
         assertNotNull(selected)
         assertEquals("172.22.0.21", selected.host)
         assertEquals(5060, selected.port)
-        assertEquals(PcscfDiscoverySource.DNS_A_AAAA, selected.source)
-        assertEquals(PcscfDiscoverySource.DNS_A_AAAA, selected.endpoint.source)
+        assertEquals(PcscfDiscoverySource.DNS_RESOLVED, selected.source)
+        assertEquals(PcscfDiscoverySource.DNS_RESOLVED, selected.endpoint.source)
         assertFalse("Must not be marked fallback when discovered via DNS", selected.isFallback)
-        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Discovered)
+        assertEquals(PcscfDiscoveryMethod.NETWORK_DNS, selected.discoveryMethod)
+        assertEquals("pcscf.ims.mnc070.mcc901.3gppnetwork.org", selected.configuredHost)
+        assertEquals("172.22.0.21", selected.resolvedAddress)
+        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.DnsResolved)
+        assertEquals("DNS_RESOLVED", provider.discoveryState.value.toString())
         assertSameEndpointAndSource(selected)
     }
 
     @Test
-    fun testStaticFallbackSelectedOnlyAfterDiscoveryFailure() = runBlocking {
+    fun testFallbackSelectedOnlyAfterNetworkDnsFailure() = runBlocking {
         val provider = DefaultPcscfDiscoveryProvider()
 
-        // Explicit FQDN configured, but DNS returns no addresses (fails)
+        // DNS returns no addresses (fails)
         provider.dnsResolver = { _, _ -> emptyArray() }
 
+        val dnsConfig = testConfig.copy(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            dnsFqdn = "pcscf.nonexistent.domain"
+        )
         val selected = provider.discover(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            config = dnsConfig,
             network = null,
-            explicitPcscfFqdn = "pcscf.nonexistent.domain",
-            legacyFallback = legacyFallback
+            dnsServers = listOf("192.168.102.1")
         )
 
         assertNotNull(selected)
-        assertEquals("172.30.104.240", selected.host)
+        assertEquals("172.22.0.21", selected.host)
         assertEquals(5060, selected.port)
-        assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.source)
-        assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.endpoint.source)
+        assertEquals(PcscfDiscoverySource.FALLBACK, selected.source)
+        assertEquals(PcscfDiscoverySource.FALLBACK, selected.endpoint.source)
         assertTrue("Must be marked fallback after discovery failure", selected.isFallback)
-        assertTrue(selected.statusDetail.contains("returned no addresses"))
-        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Fallback)
+        assertNotNull("Failure reason must be documented", selected.failureReason)
+        assertTrue(selected.failureReason!!.contains("returned no addresses") || selected.failureReason!!.contains("No active MCPTT network"))
+        assertTrue(provider.discoveryState.value is PcscfDiscoveryState.DnsFailed)
+        assertEquals("DNS_FAILED", provider.discoveryState.value.toString())
         assertSameEndpointAndSource(selected)
     }
 
@@ -99,24 +152,26 @@ class PcscfDiscoveryTest {
     fun testBlankFqdnDoesNotClaimDnsDiscovery() = runBlocking {
         val provider = DefaultPcscfDiscoveryProvider()
 
-        // Blank or null FQDN MUST NOT claim DNS discovery
-        val testFqdns = listOf(null, "", "   ")
+        val testFqdns = listOf("", "   ")
         for (blankFqdn in testFqdns) {
+            val blankConfig = testConfig.copy(
+                method = PcscfDiscoveryMethod.NETWORK_DNS,
+                dnsFqdn = blankFqdn
+            )
             val selected = provider.discover(
-                network = null,
-                explicitPcscfFqdn = blankFqdn,
-                legacyFallback = legacyFallback
+                method = PcscfDiscoveryMethod.NETWORK_DNS,
+                config = blankConfig,
+                network = null
             )
 
             assertNotNull(selected)
-            assertNotEquals("Blank FQDN must not claim DNS discovery", PcscfDiscoverySource.DNS_A_AAAA, selected.source)
-            assertEquals("172.30.104.240", selected.host)
+            assertNotEquals("Blank FQDN must not claim DNS discovery", PcscfDiscoverySource.DNS_RESOLVED, selected.source)
+            assertEquals("172.22.0.21", selected.host)
             assertEquals(5060, selected.port)
-            assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.source)
-            assertEquals(PcscfDiscoverySource.STATIC_LEGACY, selected.endpoint.source)
+            assertEquals(PcscfDiscoverySource.FALLBACK, selected.source)
             assertTrue(selected.isFallback)
-            assertTrue("Status must clearly report no P-CSCF FQDN provisioned", selected.statusDetail.contains("no P-CSCF FQDN provisioned"))
-            assertTrue(provider.discoveryState.value is PcscfDiscoveryState.Fallback)
+            assertEquals("no P-CSCF FQDN provisioned", selected.failureReason)
+            assertTrue(provider.discoveryState.value is PcscfDiscoveryState.DnsFailed)
             assertSameEndpointAndSource(selected)
         }
     }
@@ -127,6 +182,7 @@ class PcscfDiscoveryTest {
         val customEndpoint = PcscfEndpoint(
             host = "10.0.0.1",
             port = 5060,
+            resolvedIp = "10.0.0.1",
             transport = "UDP",
             source = PcscfDiscoverySource.MANUAL_OVERRIDE
         )
@@ -142,25 +198,26 @@ class PcscfDiscoveryTest {
         assertSameEndpointAndSource(selected)
     }
 
-    private fun assertSameEndpointAndSource(selected: com.example.sip.discovery.SelectedPcscf) {
+    private fun assertSameEndpointAndSource(selected: SelectedPcscf) {
         assertEquals("Selected source must match selected endpoint source", selected.source, selected.endpoint.source)
-        assertEquals("Selected host must match endpoint host", selected.host, selected.endpoint.host)
+        assertEquals("Selected host must match endpoint host", selected.host, selected.endpoint.effectiveHost)
         assertEquals("Selected port must match endpoint port", selected.port, selected.endpoint.port)
     }
 
     @Test
     fun testDiscoverySourcesHonestyClassification() {
-        // Verify standards classification according to prompt requirements
-        assertTrue(PcscfDiscoverySource.STATIC_LEGACY.isAvailableToStandardApp)
-        assertTrue(PcscfDiscoverySource.STATIC_LEGACY.isImplemented)
+        // Verify standards classification
+        assertTrue(PcscfDiscoverySource.PRECONFIGURED.isAvailableToStandardApp)
+        assertTrue(PcscfDiscoverySource.PRECONFIGURED.isImplemented)
 
-        assertTrue(PcscfDiscoverySource.DNS_A_AAAA.isAvailableToStandardApp)
-        assertTrue(PcscfDiscoverySource.DNS_A_AAAA.isImplemented)
+        assertTrue(PcscfDiscoverySource.DNS_RESOLVED.isAvailableToStandardApp)
+        assertTrue(PcscfDiscoverySource.DNS_RESOLVED.isImplemented)
 
-        // DNS_SRV is not yet implemented; marked false
-        assertFalse(PcscfDiscoverySource.DNS_SRV.isImplemented)
+        assertTrue(PcscfDiscoverySource.FALLBACK.isAvailableToStandardApp)
+        assertTrue(PcscfDiscoverySource.FALLBACK.isImplemented)
 
         // Carrier/platform restricted
+        assertFalse(PcscfDiscoverySource.DNS_SRV.isImplemented)
         assertFalse(PcscfDiscoverySource.DHCP_OPTION_120.isAvailableToStandardApp)
         assertFalse(PcscfDiscoverySource.PCO_PROVISIONED.isAvailableToStandardApp)
         assertFalse(PcscfDiscoverySource.ISIM_EF_PCSCF.isAvailableToStandardApp)
@@ -183,10 +240,10 @@ class PcscfDiscoveryTest {
         // 1. Initial / out-of-dialog: routes to P-CSCF
         val initialHop = SipNextHopResolver.resolveOutOfDialogDestination(
             selectedPcscf = null,
-            fallbackHost = "172.30.104.240",
+            fallbackHost = "172.22.0.21",
             fallbackPort = 5060
         )
-        assertEquals("172.30.104.240", initialHop.host)
+        assertEquals("172.22.0.21", initialHop.host)
         assertEquals(5060, initialHop.port)
 
         // 2. In-dialog with Route set: routes to first Route
@@ -194,7 +251,7 @@ class PcscfDiscoveryTest {
             routeSet = listOf("sip:pcscf-edge.ims.net:5060;lr", "sip:scscf.ims.net:6060;lr"),
             remoteTargetUri = "sip:user@10.0.1.5:5060",
             selectedPcscf = null,
-            fallbackHost = "172.30.104.240",
+            fallbackHost = "172.22.0.21",
             fallbackPort = 5060
         )
         assertEquals("pcscf-edge.ims.net", inDialogWithRoute.host)
@@ -205,7 +262,7 @@ class PcscfDiscoveryTest {
             routeSet = emptyList(),
             remoteTargetUri = "sip:contact-peer@192.168.102.7:5062",
             selectedPcscf = null,
-            fallbackHost = "172.30.104.240",
+            fallbackHost = "172.22.0.21",
             fallbackPort = 5060
         )
         assertEquals("192.168.102.7", inDialogNoRoute.host)
@@ -223,10 +280,57 @@ class PcscfDiscoveryTest {
             requestMsg = parsedMsg,
             packetSourceHost = "192.168.102.20",
             packetSourcePort = 5088,
-            defaultPcscfHost = "172.30.104.240",
+            defaultPcscfHost = "172.22.0.21",
             defaultPcscfPort = 5060
         )
         assertEquals("192.168.102.20", responseHop.host)
         assertEquals(5088, responseHop.port)
+    }
+
+    @Test
+    fun testAcceptanceCriterionNetworkDnsDiscoversPcscfAndRoutesRegister() = runBlocking {
+        // Acceptance Test:
+        // With P-CSCF configuration = NETWORK_DNS, FQDN = pcscf.ims.mnc070.mcc901.3gppnetwork.org
+        // The app must discover the current P-CSCF IP through the MCPTT Network and then send REGISTER to the discovered IP:5060.
+        val provider = DefaultPcscfDiscoveryProvider()
+
+        provider.dnsResolver = { _, fqdn ->
+            if (fqdn == "pcscf.ims.mnc070.mcc901.3gppnetwork.org") {
+                arrayOf(InetAddress.getByName("172.22.0.21"))
+            } else {
+                emptyArray()
+            }
+        }
+
+        val dnsConfig = PcscfConfig(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            preconfiguredHost = "10.99.99.99", // dummy fallback to prove DNS resolution wins
+            preconfiguredPort = 5060,
+            dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org",
+            dnsPort = 5060
+        )
+
+        val selected = provider.discover(
+            method = PcscfDiscoveryMethod.NETWORK_DNS,
+            config = dnsConfig,
+            network = null,
+            dnsServers = listOf("192.168.102.1")
+        )
+
+        assertEquals("172.22.0.21", selected.host)
+        assertEquals(5060, selected.port)
+        assertEquals(PcscfDiscoverySource.DNS_RESOLVED, selected.source)
+        assertFalse(selected.isFallback)
+
+        // Resolve SIP next-hop destination for out-of-dialog REGISTER request
+        val dest = SipNextHopResolver.resolveOutOfDialogDestination(
+            selectedPcscf = selected,
+            fallbackHost = dnsConfig.preconfiguredHost,
+            fallbackPort = dnsConfig.preconfiguredPort
+        )
+
+        assertEquals("172.22.0.21", dest.host)
+        assertEquals(5060, dest.port)
+        assertEquals("172.22.0.21:5060", dest.toHostPort())
     }
 }

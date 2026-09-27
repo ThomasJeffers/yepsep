@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Network
 import android.util.Log
 import com.example.sip.discovery.DefaultPcscfDiscoveryProvider
+import com.example.sip.discovery.PcscfDiscoveryMethod
 import com.example.sip.discovery.PcscfDiscoveryProvider
 import com.example.sip.discovery.PcscfDiscoverySource
 import com.example.sip.discovery.PcscfDiscoveryState
@@ -98,13 +99,13 @@ class McpttSipStack(
      * Authoritative P-CSCF host for initial/out-of-dialog IMS requests.
      */
     val currentPcscfHost: String
-        get() = selectedPcscf.value?.host ?: profile.pcscfHost
+        get() = selectedPcscf.value?.host ?: profile.effectivePcscfConfig.preconfiguredHost
 
     /**
      * Authoritative P-CSCF port for initial/out-of-dialog IMS requests.
      */
     val currentPcscfPort: Int
-        get() = selectedPcscf.value?.port ?: profile.pcscfPort
+        get() = selectedPcscf.value?.port ?: profile.effectivePcscfConfig.preconfiguredPort
 
     private val _negotiatedMedia = MutableStateFlow<NegotiatedMedia?>(null)
     val negotiatedMedia: StateFlow<NegotiatedMedia?> = _negotiatedMedia.asStateFlow()
@@ -137,18 +138,33 @@ class McpttSipStack(
     }
 
     fun injectSimulatedPacket(rawSip: String) {
-        handleIncomingPacket(rawSip, profile.pcscfHost, profile.pcscfPort, sipSocket)
+        val host = selectedPcscf.value?.host ?: profile.effectivePcscfConfig.preconfiguredHost
+        val port = selectedPcscf.value?.port ?: profile.effectivePcscfConfig.preconfiguredPort
+        handleIncomingPacket(rawSip, host, port, sipSocket)
     }
 
     fun start(context: Context, initialProfile: SipProfile) {
         this.profile = initialProfile
 
-        // Initiate P-CSCF discovery lifecycle (DISCOVERING -> Discovered or Fallback)
-        pcscfDiscoveryProvider.startDiscovery()
+        // Initiate P-CSCF discovery lifecycle with selected method
+        pcscfDiscoveryProvider.startDiscovery(initialProfile.effectivePcscfConfig.method)
 
         val netMgr = McpttApnNetworkManager(context.applicationContext, scope)
         this.apnManager = netMgr
         netMgr.updateConfig(initialProfile.apnName, initialProfile.apnPrefix)
+
+        // If PRECONFIGURED method is selected, discover preconfigured endpoint immediately
+        if (initialProfile.effectivePcscfConfig.method == PcscfDiscoveryMethod.PRECONFIGURED) {
+            scope.launch {
+                val dnsServers = netMgr.getDnsServers(netMgr.activeNetwork)
+                pcscfDiscoveryProvider.discover(
+                    method = PcscfDiscoveryMethod.PRECONFIGURED,
+                    config = initialProfile.effectivePcscfConfig,
+                    network = netMgr.activeNetwork,
+                    dnsServers = dnsServers
+                )
+            }
+        }
 
         // Initialize ONE stable DatagramSocket for the lifetime of this stack
         initSocket()
@@ -190,16 +206,12 @@ class McpttSipStack(
 
                         // Trigger P-CSCF acquisition over the bound cellular network
                         scope.launch {
-                            val legacyFallback = PcscfEndpoint(
-                                host = profile.pcscfHost,
-                                port = profile.pcscfPort,
-                                transport = profile.transport,
-                                source = PcscfDiscoverySource.STATIC_LEGACY
-                            )
+                            val dnsServers = netMgr.getDnsServers(netMgr.activeNetwork)
                             pcscfDiscoveryProvider.discover(
+                                method = profile.effectivePcscfConfig.method,
+                                config = profile.effectivePcscfConfig,
                                 network = netMgr.activeNetwork,
-                                explicitPcscfFqdn = profile.pcscfFqdn.ifBlank { null },
-                                legacyFallback = legacyFallback
+                                dnsServers = dnsServers
                             )
                         }
 
@@ -211,16 +223,12 @@ class McpttSipStack(
                     is ApnNetworkStatus.Disconnected, is ApnNetworkStatus.NoMcpttPdn -> {
                         if (selectedPcscf.value == null) {
                             scope.launch {
-                                val legacyFallback = PcscfEndpoint(
-                                    host = profile.pcscfHost,
-                                    port = profile.pcscfPort,
-                                    transport = profile.transport,
-                                    source = PcscfDiscoverySource.STATIC_LEGACY
-                                )
+                                val dnsServers = netMgr.getDnsServers(null)
                                 pcscfDiscoveryProvider.discover(
+                                    method = profile.effectivePcscfConfig.method,
+                                    config = profile.effectivePcscfConfig,
                                     network = null,
-                                    explicitPcscfFqdn = profile.pcscfFqdn.ifBlank { null },
-                                    legacyFallback = legacyFallback
+                                    dnsServers = dnsServers
                                 )
                             }
                         }
@@ -238,16 +246,12 @@ class McpttSipStack(
                 // Wait briefly for network / acquisition or proceed with fallback
                 delay(1200)
                 if (selectedPcscf.value == null) {
-                    val legacyFallback = PcscfEndpoint(
-                        host = profile.pcscfHost,
-                        port = profile.pcscfPort,
-                        transport = profile.transport,
-                        source = PcscfDiscoverySource.STATIC_LEGACY
-                    )
+                    val dnsServers = apnManager?.getDnsServers(apnManager?.activeNetwork) ?: emptyList()
                     pcscfDiscoveryProvider.discover(
+                        method = profile.effectivePcscfConfig.method,
+                        config = profile.effectivePcscfConfig,
                         network = apnManager?.activeNetwork,
-                        explicitPcscfFqdn = profile.pcscfFqdn.ifBlank { null },
-                        legacyFallback = legacyFallback
+                        dnsServers = dnsServers
                     )
                 }
                 register()
@@ -269,19 +273,15 @@ class McpttSipStack(
             recreateSocket()
         }
 
-        // Re-run acquisition with updated legacy fallback / FQDN
+        // Re-run discovery with updated configuration
         scope.launch {
-            pcscfDiscoveryProvider.startDiscovery()
-            val legacyFallback = PcscfEndpoint(
-                host = newProfile.pcscfHost,
-                port = newProfile.pcscfPort,
-                transport = newProfile.transport,
-                source = PcscfDiscoverySource.STATIC_LEGACY
-            )
+            pcscfDiscoveryProvider.startDiscovery(newProfile.effectivePcscfConfig.method)
+            val dnsServers = apnManager?.getDnsServers(apnManager?.activeNetwork) ?: emptyList()
             pcscfDiscoveryProvider.discover(
+                method = newProfile.effectivePcscfConfig.method,
+                config = newProfile.effectivePcscfConfig,
                 network = apnManager?.activeNetwork,
-                explicitPcscfFqdn = newProfile.pcscfFqdn.ifBlank { null },
-                legacyFallback = legacyFallback
+                dnsServers = dnsServers
             )
         }
     }
@@ -404,7 +404,7 @@ class McpttSipStack(
         }
     }
 
-    fun processIncomingSipPacket(rawSip: String, remoteHost: String = profile.pcscfHost, remotePort: Int = profile.pcscfPort) {
+    fun processIncomingSipPacket(rawSip: String, remoteHost: String = currentPcscfHost, remotePort: Int = currentPcscfPort) {
         handleIncomingPacket(rawSip, remoteHost, remotePort, sipSocket)
     }
 
@@ -649,8 +649,8 @@ class McpttSipStack(
 
         val dest = SipNextHopResolver.resolveOutOfDialogDestination(
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         Log.i(TAG, "REGISTER SEND via ${dest.description}:\n  callId=$registerCallId\n  cseq=$registerCSeq")
         sendRegisterPacket(registerCSeq, authHeader = null, destination = dest)
@@ -753,8 +753,8 @@ class McpttSipStack(
 
         val dest = SipNextHopResolver.resolveOutOfDialogDestination(
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRegisterPacket(registerCSeq, authHeaderValue, dest)
     }
@@ -820,8 +820,8 @@ class McpttSipStack(
         // Initial INVITE is out-of-dialog: next-hop is P-CSCF
         val dest = SipNextHopResolver.resolveOutOfDialogDestination(
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_INVITE, "INVITE")
     }
@@ -854,8 +854,8 @@ class McpttSipStack(
             routeSet = activeRouteSet,
             remoteTargetUri = activeRemoteTargetUri,
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_ACK, "ACK")
     }
@@ -903,8 +903,8 @@ class McpttSipStack(
             requestMsg = inviteMsg,
             packetSourceHost = packetSourceHost,
             packetSourcePort = packetSourcePort,
-            defaultPcscfHost = profile.pcscfHost,
-            defaultPcscfPort = profile.pcscfPort
+            defaultPcscfHost = profile.effectivePcscfConfig.preconfiguredHost,
+            defaultPcscfPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_RESPONSE, "200 OK")
     }
@@ -975,8 +975,8 @@ class McpttSipStack(
             routeSet = activeRouteSet,
             remoteTargetUri = activeRemoteTargetUri,
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_INFO, "INFO")
     }
@@ -1015,8 +1015,8 @@ class McpttSipStack(
             routeSet = activeRouteSet,
             remoteTargetUri = activeRemoteTargetUri,
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_BYE, "BYE")
 
@@ -1051,8 +1051,8 @@ class McpttSipStack(
         // Initial SUBSCRIBE is out-of-dialog: next-hop is P-CSCF
         val dest = SipNextHopResolver.resolveOutOfDialogDestination(
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_SUBSCRIBE, "SUBSCRIBE")
     }
@@ -1093,8 +1093,8 @@ class McpttSipStack(
         // Standalone MESSAGE is out-of-dialog: next-hop is P-CSCF
         val dest = SipNextHopResolver.resolveOutOfDialogDestination(
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_MESSAGE, "MESSAGE")
     }
@@ -1123,8 +1123,8 @@ class McpttSipStack(
         // Standalone MESSAGE is out-of-dialog: next-hop is P-CSCF
         val dest = SipNextHopResolver.resolveOutOfDialogDestination(
             selectedPcscf = selectedPcscf.value,
-            fallbackHost = profile.pcscfHost,
-            fallbackPort = profile.pcscfPort
+            fallbackHost = profile.effectivePcscfConfig.preconfiguredHost,
+            fallbackPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_MESSAGE, "MESSAGE")
     }
@@ -1155,8 +1155,8 @@ class McpttSipStack(
             requestMsg = requestMsg,
             packetSourceHost = packetSourceHost,
             packetSourcePort = packetSourcePort,
-            defaultPcscfHost = profile.pcscfHost,
-            defaultPcscfPort = profile.pcscfPort
+            defaultPcscfHost = profile.effectivePcscfConfig.preconfiguredHost,
+            defaultPcscfPort = profile.effectivePcscfConfig.preconfiguredPort
         )
         sendRawSip(sipPacket, dest.host, dest.port, LogType.SIP_RESPONSE, "$code $text")
     }

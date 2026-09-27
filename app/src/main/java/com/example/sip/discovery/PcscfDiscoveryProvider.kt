@@ -12,10 +12,9 @@ import java.net.InetAddress
 /**
  * Clean client-side abstraction for acquiring and selecting the authoritative P-CSCF endpoint.
  *
- * Distinguishes:
- * 1. DISCOVERY / PROVISIONING: Network/platform-provisioned P-CSCF information (PCO/ISIM - unavailable to standard APK).
- * 2. DNS RESOLUTION: A/AAAA resolution of an explicitly supplied/known P-CSCF FQDN over the bound MCPTT cellular network.
- * 3. STATIC FALLBACK: Proven legacy fallback configuration (172.30.104.240:5060) ensuring 100% backward compatibility.
+ * Implements two selectable discovery methods:
+ * 1. PRECONFIGURED: Single authoritative configuration supporting IPv4 literal or FQDN.
+ * 2. NETWORK_DNS: A/AAAA resolution of configured P-CSCF FQDN executed on the active MCPTT Network.
  */
 interface PcscfDiscoveryProvider {
     val discoveryState: StateFlow<PcscfDiscoveryState>
@@ -24,15 +23,25 @@ interface PcscfDiscoveryProvider {
     /**
      * Resets or initiates the discovery lifecycle to DISCOVERING.
      */
-    fun startDiscovery()
+    fun startDiscovery(method: PcscfDiscoveryMethod = PcscfDiscoveryMethod.NETWORK_DNS)
 
     /**
-     * Executes P-CSCF acquisition.
+     * Executes P-CSCF discovery according to the selected discovery method.
      *
-     * @param network The bound MCPTT cellular Network, if available.
-     * @param explicitPcscfFqdn An explicitly supplied/provisioned P-CSCF FQDN (if any).
-     *                          Does NOT guess names like pcscf.<realm> or sip.<realm>.
-     * @param legacyFallback The configured fallback endpoint (typically 172.30.104.240:5060).
+     * @param method PRECONFIGURED or NETWORK_DNS
+     * @param config The PcscfConfig containing preconfigured endpoint and DNS settings
+     * @param network The bound MCPTT cellular Network, if available
+     * @param dnsServers List of DNS server IPs reported by the MCPTT Network, if available
+     */
+    suspend fun discover(
+        method: PcscfDiscoveryMethod,
+        config: PcscfConfig,
+        network: Network?,
+        dnsServers: List<String> = emptyList()
+    ): SelectedPcscf
+
+    /**
+     * Backward-compatible overload for legacy test call sites.
      */
     suspend fun discover(
         network: Network?,
@@ -41,7 +50,7 @@ interface PcscfDiscoveryProvider {
     ): SelectedPcscf
 
     /**
-     * Sets an explicit manual override or resets to fallback immediately.
+     * Sets an explicit manual override.
      */
     fun selectManualOverride(endpoint: PcscfEndpoint)
 }
@@ -50,12 +59,11 @@ interface PcscfDiscoveryProvider {
  * Standard implementation of PcscfDiscoveryProvider.
  *
  * Implements an honest acquisition model:
- * - If an explicit P-CSCF FQDN is supplied (e.g. from carrier provisioning or user settings),
- *   resolves it using the cellular Network DNS (Network.getAllByName).
- * - Does NOT guess arbitrary hostnames from the IMS realm (e.g. pcscf.<realm>).
- * - If no explicit FQDN is supplied, or DNS returns no addresses, or discovery is unavailable
- *   to this standard APK, transparently selects the legacy fallback with:
- *   "no P-CSCF FQDN provisioned" or "DNS resolution for '<fqdn>' returned no addresses".
+ * - PRECONFIGURED: Returns preconfigured host:port with resolved IP if literal or resolvable.
+ * - NETWORK_DNS: Resolves configured FQDN strictly on the MCPTT cellular Network.
+ *   Does NOT use plain InetAddress.getAllByName() without network binding.
+ *   If DNS returns no addresses or resolution fails, falls back honestly to PRECONFIGURED with full diagnostics.
+ * - Non-carrier accessible cellular mechanisms (DHCP Option 120, PCO, ISIM) are reported as unavailable.
  */
 class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
 
@@ -63,7 +71,7 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
         private const val TAG = "PcscfDiscovery"
     }
 
-    private val _discoveryState = MutableStateFlow<PcscfDiscoveryState>(PcscfDiscoveryState.Discovering(PcscfDiscoverySource.DNS_A_AAAA))
+    private val _discoveryState = MutableStateFlow<PcscfDiscoveryState>(PcscfDiscoveryState.Discovering(PcscfDiscoveryMethod.NETWORK_DNS))
     override val discoveryState: StateFlow<PcscfDiscoveryState> = _discoveryState.asStateFlow()
 
     private val _selectedPcscf = MutableStateFlow<SelectedPcscf?>(null)
@@ -74,116 +82,241 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
      */
     var dnsResolver: (suspend (Network?, String) -> Array<InetAddress>)? = null
 
-    override fun startDiscovery() {
+    override fun startDiscovery(method: PcscfDiscoveryMethod) {
         _selectedPcscf.value = null
-        _discoveryState.value = PcscfDiscoveryState.Discovering(PcscfDiscoverySource.DNS_A_AAAA)
+        _discoveryState.value = PcscfDiscoveryState.Discovering(method)
     }
 
     override suspend fun discover(
+        method: PcscfDiscoveryMethod,
+        config: PcscfConfig,
         network: Network?,
-        explicitPcscfFqdn: String?,
-        legacyFallback: PcscfEndpoint
+        dnsServers: List<String>
     ): SelectedPcscf = withContext(Dispatchers.IO) {
-        val fqdn = explicitPcscfFqdn?.trim() ?: ""
+        when (method) {
+            PcscfDiscoveryMethod.PRECONFIGURED -> {
+                discoverPreconfigured(config, network, dnsServers)
+            }
+            PcscfDiscoveryMethod.NETWORK_DNS -> {
+                discoverNetworkDns(config, network, dnsServers)
+            }
+        }
+    }
+
+    private suspend fun discoverPreconfigured(
+        config: PcscfConfig,
+        network: Network?,
+        dnsServers: List<String>
+    ): SelectedPcscf {
+        val rawHost = config.preconfiguredHost.trim()
+        val port = config.preconfiguredPort
+        Log.i(TAG, "P-CSCF discovery started: PRECONFIGURED host=$rawHost:$port")
+
+        val isLiteral = PcscfConfig.isIpv4Literal(rawHost) || rawHost.contains(":")
+        var resolvedIp: String? = null
+
+        if (isLiteral) {
+            resolvedIp = rawHost
+        } else if (rawHost.isNotEmpty()) {
+            // Preconfigured host is an FQDN: attempt resolution over MCPTT network if available
+            try {
+                val addrs = if (dnsResolver != null) {
+                    dnsResolver!!.invoke(network, rawHost)
+                } else if (network != null) {
+                    network.getAllByName(rawHost)
+                } else {
+                    emptyArray()
+                }
+                resolvedIp = addrs.firstOrNull()?.hostAddress
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not resolve preconfigured FQDN '$rawHost': ${e.message}")
+            }
+        }
+
+        val endpoint = PcscfEndpoint(
+            host = rawHost,
+            port = port,
+            resolvedIp = resolvedIp,
+            source = PcscfDiscoverySource.PRECONFIGURED,
+            timestamp = System.currentTimeMillis(),
+            transport = config.transport
+        )
+
+        val selection = SelectedPcscf(
+            endpoint = endpoint,
+            source = PcscfDiscoverySource.PRECONFIGURED,
+            isFallback = false,
+            discoveryMethod = PcscfDiscoveryMethod.PRECONFIGURED,
+            configuredHost = rawHost,
+            resolvedAddress = resolvedIp ?: rawHost,
+            selectedNetwork = network?.toString(),
+            dnsServers = dnsServers,
+            failureReason = null,
+            networkInfo = network?.toString(),
+            candidatesEvaluated = listOf(endpoint),
+            statusDetail = "Preconfigured P-CSCF: ${endpoint.toHostPort()}"
+        )
+
+        Log.i(TAG, "P-CSCF discovery result=PRECONFIGURED ${selection.endpoint.toHostPort()}")
+        _selectedPcscf.value = selection
+        _discoveryState.value = PcscfDiscoveryState.Preconfigured(selection)
+        return selection
+    }
+
+    private suspend fun discoverNetworkDns(
+        config: PcscfConfig,
+        network: Network?,
+        dnsServers: List<String>
+    ): SelectedPcscf {
+        val fqdn = config.dnsFqdn.trim()
+        val port = config.dnsPort
         Log.i(TAG, "P-CSCF discovery started on MCPTT network")
         Log.i(TAG, "P-CSCF DNS FQDN=${if (fqdn.isNotEmpty()) fqdn else "<none>"}")
 
         // Log unavailability of carrier/platform-restricted mechanisms honestly
-        Log.d(TAG, "P-CSCF DHCP Option 120 unavailable: cellular DHCP options not exposed to non-carrier app")
-        Log.d(TAG, "P-CSCF 3GPP NAS PCO unavailable: requires carrier privileges")
-        Log.d(TAG, "P-CSCF UICC ISIM EF_PCSCF unavailable: requires carrier privileges (READ_PRIVILEGED_PHONE_STATE)")
+        Log.i(TAG, "P-CSCF DHCP Option 120 unavailable: cellular DHCP options not exposed by public Android APIs to non-carrier apps")
+        Log.i(TAG, "P-CSCF 3GPP NAS PCO unavailable: requires carrier privileges")
+        Log.i(TAG, "P-CSCF UICC ISIM EF_PCSCF unavailable: requires carrier privileges (READ_PRIVILEGED_PHONE_STATE)")
+
+        _discoveryState.value = PcscfDiscoveryState.Discovering(PcscfDiscoveryMethod.NETWORK_DNS)
 
         val candidates = mutableListOf<PcscfEndpoint>()
+        var failureReason: String? = null
 
         if (fqdn.isNotEmpty()) {
-            _discoveryState.value = PcscfDiscoveryState.Discovering(PcscfDiscoverySource.DNS_A_AAAA)
             try {
-                Log.i(TAG, "Resolving explicit P-CSCF FQDN: '$fqdn' over cellular network...")
+                Log.i(TAG, "Resolving P-CSCF FQDN: '$fqdn' over MCPTT cellular network (network=$network)...")
                 val addresses: Array<InetAddress> = if (dnsResolver != null) {
                     dnsResolver!!.invoke(network, fqdn)
                 } else if (network != null) {
                     network.getAllByName(fqdn)
                 } else {
+                    Log.w(TAG, "No MCPTT Network instance available for network-bound DNS resolution")
                     emptyArray()
                 }
 
                 for (addr in addresses) {
                     val hostStr = addr.hostAddress ?: continue
                     val candidate = PcscfEndpoint(
-                        host = hostStr,
-                        port = legacyFallback.port,
-                        transport = legacyFallback.transport,
-                        source = PcscfDiscoverySource.DNS_A_AAAA,
+                        host = fqdn,
+                        port = port,
+                        resolvedIp = hostStr,
+                        source = PcscfDiscoverySource.DNS_RESOLVED,
+                        timestamp = System.currentTimeMillis(),
+                        transport = config.transport,
                         priority = 10,
                         weight = 0
                     )
-                    if (!candidates.any { it.host == candidate.host && it.port == candidate.port }) {
+                    if (!candidates.any { it.resolvedIp == candidate.resolvedIp && it.port == candidate.port }) {
                         Log.i(TAG, "Resolved P-CSCF address: ${candidate.toHostPort()} from FQDN '$fqdn'")
                         candidates.add(candidate)
                     }
                 }
+
+                if (candidates.isEmpty()) {
+                    failureReason = if (network == null) {
+                        "No active MCPTT network bound for DNS"
+                    } else {
+                        "DNS resolution for '$fqdn' returned no addresses"
+                    }
+                }
             } catch (e: Exception) {
-                Log.w(TAG, "DNS resolution for explicit FQDN '$fqdn' failed: ${e.message}")
+                failureReason = "DNS resolution for '$fqdn' failed: ${e.message}"
+                Log.w(TAG, failureReason)
             }
         } else {
-            Log.i(TAG, "P-CSCF DNS discovery: no P-CSCF FQDN provisioned")
+            failureReason = "no P-CSCF FQDN provisioned"
+            Log.i(TAG, "P-CSCF DNS discovery: $failureReason")
         }
 
         val selection: SelectedPcscf
         if (candidates.isNotEmpty()) {
             // Deterministic candidate selection:
             // 1. Prefer IPv4 for compatibility with current IPv4 LTE bearer pool (192.168.102.x)
-            // 2. Sort by priority descending, then lexicographical host order
+            // 2. Sort by priority descending, then lexicographical IP order
             val sorted = candidates.sortedWith(
-                compareBy<PcscfEndpoint> { it.isIpv6 } // false (IPv4) first
+                compareBy<PcscfEndpoint> { it.isIpv6 }
                     .thenByDescending { it.priority }
-                    .thenBy { it.host }
+                    .thenBy { it.resolvedIp ?: it.host }
             )
             val chosen = sorted.first()
             selection = SelectedPcscf(
                 endpoint = chosen,
-                source = PcscfDiscoverySource.DNS_A_AAAA,
+                source = PcscfDiscoverySource.DNS_RESOLVED,
                 isFallback = false,
+                discoveryMethod = PcscfDiscoveryMethod.NETWORK_DNS,
+                configuredHost = fqdn,
+                resolvedAddress = chosen.resolvedIp,
+                selectedNetwork = network?.toString(),
+                dnsServers = dnsServers,
+                failureReason = null,
                 networkInfo = network?.toString(),
                 candidatesEvaluated = sorted,
-                statusDetail = "Resolved ${candidates.size} address(es) for explicit FQDN '$fqdn' via cellular DNS"
+                statusDetail = "Resolved ${candidates.size} address(es) for FQDN '$fqdn' via MCPTT cellular DNS"
             )
-            Log.i(TAG, "P-CSCF discovery result=${selection.source.name} ${selection.endpoint.toHostPort()}")
+            Log.i(TAG, "P-CSCF discovery result=DNS_RESOLVED ${selection.endpoint.toHostPort()}")
             _selectedPcscf.value = selection
-            _discoveryState.value = PcscfDiscoveryState.Discovered(selection)
+            _discoveryState.value = PcscfDiscoveryState.DnsResolved(selection, fqdn)
         } else {
-            // Static legacy fallback is selected ONLY after all implemented discovery fails
-            val fallbackReason = if (fqdn.isEmpty()) {
-                "no P-CSCF FQDN provisioned"
-            } else {
-                "DNS resolution for '$fqdn' returned no addresses"
-            }
-            Log.i(TAG, "P-CSCF fallback selected because=$fallbackReason")
+            // Fall back to preconfigured P-CSCF
+            val reason = failureReason ?: "DNS resolution failed"
+            Log.i(TAG, "P-CSCF fallback selected because=$reason")
 
-            val fallbackEndpoint = legacyFallback.copy(source = PcscfDiscoverySource.STATIC_LEGACY)
+            val fallbackBase = config.toPreconfiguredEndpoint(source = PcscfDiscoverySource.FALLBACK)
+            val fallbackEndpoint = fallbackBase.copy(
+                source = PcscfDiscoverySource.FALLBACK,
+                timestamp = System.currentTimeMillis()
+            )
+
             selection = SelectedPcscf(
                 endpoint = fallbackEndpoint,
-                source = PcscfDiscoverySource.STATIC_LEGACY,
+                source = PcscfDiscoverySource.FALLBACK,
                 isFallback = true,
+                discoveryMethod = PcscfDiscoveryMethod.NETWORK_DNS,
+                configuredHost = fqdn,
+                resolvedAddress = fallbackEndpoint.resolvedIp,
+                selectedNetwork = network?.toString(),
+                dnsServers = dnsServers,
+                failureReason = reason,
                 networkInfo = network?.toString(),
                 candidatesEvaluated = emptyList(),
-                statusDetail = fallbackReason
+                statusDetail = "Fallback to preconfigured P-CSCF: $reason"
             )
-            Log.i(TAG, "P-CSCF discovery result=${selection.source.name} ${selection.endpoint.toHostPort()}")
+            Log.i(TAG, "P-CSCF discovery result=FALLBACK ${selection.endpoint.toHostPort()}")
             _selectedPcscf.value = selection
-            _discoveryState.value = PcscfDiscoveryState.Fallback(selection, fallbackReason)
+            _discoveryState.value = PcscfDiscoveryState.DnsFailed(selection, reason, fallbackEndpoint)
         }
 
-        selection
+        return selection
+    }
+
+    override suspend fun discover(
+        network: Network?,
+        explicitPcscfFqdn: String?,
+        legacyFallback: PcscfEndpoint
+    ): SelectedPcscf {
+        val fqdn = explicitPcscfFqdn?.trim() ?: ""
+        val method = if (fqdn.isNotEmpty()) PcscfDiscoveryMethod.NETWORK_DNS else PcscfDiscoveryMethod.PRECONFIGURED
+        val config = PcscfConfig(
+            method = method,
+            preconfiguredHost = legacyFallback.host,
+            preconfiguredPort = legacyFallback.port,
+            dnsFqdn = fqdn,
+            dnsPort = legacyFallback.port,
+            transport = legacyFallback.transport
+        )
+        return discover(method, config, network, emptyList())
     }
 
     override fun selectManualOverride(endpoint: PcscfEndpoint) {
-        val isLegacy = endpoint.source == PcscfDiscoverySource.STATIC_LEGACY
+        val isFallback = endpoint.source == PcscfDiscoverySource.FALLBACK || endpoint.source == PcscfDiscoverySource.STATIC_LEGACY
         val selection = SelectedPcscf(
             endpoint = endpoint,
             source = endpoint.source,
-            isFallback = isLegacy,
-            statusDetail = if (isLegacy) "Manual legacy static fallback" else "Manual override"
+            isFallback = isFallback,
+            configuredHost = endpoint.host,
+            resolvedAddress = endpoint.resolvedIp,
+            statusDetail = if (isFallback) "Manual static fallback" else "Manual override"
         )
         Log.i(TAG, "P-CSCF manually set to: ${selection.endpoint.toHostPort()} (${selection.source.name})")
         _selectedPcscf.value = selection

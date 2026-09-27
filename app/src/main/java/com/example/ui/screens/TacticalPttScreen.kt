@@ -251,7 +251,11 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                                 }
                                 selectedPcscf != null -> {
                                     val sel = selectedPcscf!!
-                                    "P-CSCF: ${sel.endpoint.toHostPort()} [${sel.source.name}]"
+                                    if (sel.isFallback) {
+                                        "P-CSCF: ${sel.endpoint.toHostPort()} [FALLBACK]"
+                                    } else {
+                                        "P-CSCF: ${sel.endpoint.toHostPort()} [${sel.source.displayName}]"
+                                    }
                                 }
                                 else -> {
                                     "P-CSCF: [DISCOVERING]"

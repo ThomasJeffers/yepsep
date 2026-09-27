@@ -352,13 +352,28 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
             append("Generated: ${dateFormat.format(Date())}\n")
             append("Subscriber IMSI: ${profile.imsi} | IMPU: ${profile.mcpttId}\n")
             val sel = selectedPcscf.value
-            val pDesc = if (sel != null) {
-                "${sel.endpoint.toHostPort()} [Source: ${sel.source.name} | Fallback: ${sel.isFallback}]"
-            } else {
-                "${profile.pcscfHost}:${profile.pcscfPort} [Static Profile Default]"
-            }
-            append("Authoritative P-CSCF: $pDesc\n")
+            val authPcscf = sel?.endpoint?.toHostPort() ?: "${profile.sipDestinationHost()}:${profile.sipDestinationPort()}"
+            append("Authoritative P-CSCF: $authPcscf\n")
             append("Discovery State: ${pcscfDiscoveryState.value}\n")
+            if (sel != null) {
+                if (sel.discoveryMethod == com.example.sip.discovery.PcscfDiscoveryMethod.NETWORK_DNS && !sel.isFallback) {
+                    append("Discovery FQDN: ${sel.configuredHost}\n")
+                }
+                append("Fallback: ${sel.isFallback}\n")
+                if (sel.isFallback) {
+                    append("Fallback P-CSCF: ${sel.endpoint.toHostPort()}\n")
+                    sel.failureReason?.let { append("Fallback Reason: $it\n") }
+                }
+                append("Source: ${sel.source.displayName}\n")
+                if (sel.selectedNetwork != null) {
+                    append("Selected Network: ${sel.selectedNetwork}\n")
+                }
+                if (sel.dnsServers.isNotEmpty()) {
+                    append("Network DNS Servers: ${sel.dnsServers.joinToString(", ")}\n")
+                }
+            } else {
+                append("Fallback: false\n")
+            }
             append("Local SIP Port: ${profile.localSipPort} | Local APN IPv4: ${sipStack.apnManager?.boundIp ?: "Unbound"}\n")
             append("Total Packets Exported: ${logsToExport.size}\n")
             append("================================================================================\n\n")
@@ -423,10 +438,12 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
     fun simulateIncomingMcpttInvite() {
         val simUser = "sip:491234567890124@${sipProfile.value.realm}"
         val simTarget = sipProfile.value.targetGroup
+        val pHost = selectedPcscf.value?.host ?: sipProfile.value.sipDestinationHost()
+        val pPort = selectedPcscf.value?.port ?: sipProfile.value.sipDestinationPort()
         val rawSip = """
             INVITE $simTarget SIP/2.0
-            Via: SIP/2.0/UDP ${sipProfile.value.pcscfHost}:5060;branch=z9hG4bK-sim123;rport
-            Record-Route: <sip:${sipProfile.value.pcscfHost}:5060;lr>
+            Via: SIP/2.0/UDP $pHost:$pPort;branch=z9hG4bK-sim123;rport
+            Record-Route: <sip:$pHost:$pPort;lr>
             From: <$simUser>;tag=sim9988
             To: <$simTarget>
             Call-ID: sim-call-${System.currentTimeMillis()}@${sipProfile.value.realm}
@@ -438,9 +455,9 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
             Content-Length: 180
             
             v=0
-            o=sim_user 1234 1234 IN IP4 ${sipProfile.value.pcscfHost}
+            o=sim_user 1234 1234 IN IP4 $pHost
             s=MCPTT Call
-            c=IN IP4 ${sipProfile.value.pcscfHost}
+            c=IN IP4 $pHost
             m=audio 6002 RTP/AVP 0
             a=rtpmap:0 PCMU/8000
         """.trimIndent().replace("\n", "\r\n")

@@ -24,6 +24,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -44,6 +46,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.sip.discovery.PcscfConfig
+import com.example.sip.discovery.PcscfDiscoveryMethod
 import com.example.sip.engine.ApnNetworkStatus
 import com.example.sip.model.SipProfile
 import com.example.ui.McpttViewModel
@@ -69,9 +73,11 @@ fun SettingsScreen(viewModel: McpttViewModel) {
     var mcpttId by remember(currentProfile) { mutableStateOf(currentProfile.mcpttId) }
     var realm by remember(currentProfile) { mutableStateOf(currentProfile.realm) }
     var password by remember(currentProfile) { mutableStateOf(currentProfile.password) }
-    var pcscfHost by remember(currentProfile) { mutableStateOf(currentProfile.pcscfHost) }
-    var pcscfPort by remember(currentProfile) { mutableStateOf(currentProfile.pcscfPort.toString()) }
-    var pcscfFqdn by remember(currentProfile) { mutableStateOf(currentProfile.pcscfFqdn) }
+    var pcscfMethod by remember(currentProfile) { mutableStateOf(currentProfile.effectivePcscfConfig.method) }
+    var pcscfHost by remember(currentProfile) { mutableStateOf(currentProfile.effectivePcscfConfig.preconfiguredHost) }
+    var pcscfPort by remember(currentProfile) { mutableStateOf(currentProfile.effectivePcscfConfig.preconfiguredPort.toString()) }
+    var pcscfFqdn by remember(currentProfile) { mutableStateOf(currentProfile.effectivePcscfConfig.dnsFqdn) }
+    var pcscfDnsPort by remember(currentProfile) { mutableStateOf(currentProfile.effectivePcscfConfig.dnsPort.toString()) }
     var mcpttAsHost by remember(currentProfile) { mutableStateOf(currentProfile.mcpttAsHost) }
     var mcpttAsPort by remember(currentProfile) { mutableStateOf(currentProfile.mcpttAsPort.toString()) }
     var userAgent by remember(currentProfile) { mutableStateOf(currentProfile.userAgent) }
@@ -162,8 +168,11 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     imsi = "491234567890123"
                     displayName = "MCPTT UE-1"
                     mcpttId = "sip:491234567890123@ims.mnc070.mcc901.3gppnetwork.org"
-                    pcscfHost = "172.30.104.240"
+                    pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED
+                    pcscfHost = "172.22.0.21"
                     pcscfPort = "5060"
+                    pcscfFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
+                    pcscfDnsPort = "5060"
                     apnName = "mcptt"
                     apnPrefix = "192.168.102."
                     localSipPort = "5062"
@@ -184,8 +193,11 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     imsi = "491234567890124"
                     displayName = "MCPTT UE-2"
                     mcpttId = "sip:491234567890124@ims.mnc070.mcc901.3gppnetwork.org"
-                    pcscfHost = "172.30.104.240"
+                    pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED
+                    pcscfHost = "172.22.0.21"
                     pcscfPort = "5060"
+                    pcscfFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
+                    pcscfDnsPort = "5060"
                     apnName = "mcptt"
                     apnPrefix = "192.168.102."
                     localSipPort = "5064"
@@ -222,22 +234,58 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         Spacer(modifier = Modifier.height(12.dp))
 
         // SECTION 2: SIP PROXY / P-CSCF
-        Text("2. P-CSCF ENDPOINT & ACQUISITION CONFIGURATION", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-        Text("Proven static fallback (172.30.104.240:5060) is always used if no explicit FQDN is provided or if cellular DNS resolution fails.", fontSize = 10.sp, color = HighDensityTextSecondary)
+        Text("2. P-CSCF ENDPOINT & DISCOVERY METHOD", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+        Text("Select standard-compliant discovery method: PRECONFIGURED (IP or FQDN) or NETWORK_DNS (Cellular Network DNS resolution)", fontSize = 10.sp, color = HighDensityTextSecondary)
         Spacer(modifier = Modifier.height(6.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            FilterChip(
+                selected = pcscfMethod == PcscfDiscoveryMethod.PRECONFIGURED,
+                onClick = { pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED },
+                label = { Text("PRECONFIGURED", fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace) },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = HighDensityNavy,
+                    selectedLabelColor = androidx.compose.ui.graphics.Color.White
+                ),
+                modifier = Modifier.weight(1f).testTag("method_preconfigured")
+            )
+            FilterChip(
+                selected = pcscfMethod == PcscfDiscoveryMethod.NETWORK_DNS,
+                onClick = { pcscfMethod = PcscfDiscoveryMethod.NETWORK_DNS },
+                label = { Text("NETWORK_DNS", fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace) },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = HighDensityNavy,
+                    selectedLabelColor = androidx.compose.ui.graphics.Color.White
+                ),
+                modifier = Modifier.weight(1f).testTag("method_network_dns")
+            )
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             Box(modifier = Modifier.weight(2f)) {
-                OutlinedField("Legacy Fallback IP (Known-Good)", pcscfHost) { pcscfHost = it }
+                OutlinedField("Preconfigured Host / IPv4 Literal", pcscfHost) { pcscfHost = it }
             }
             Box(modifier = Modifier.weight(1f)) {
                 OutlinedField("Port", pcscfPort) { pcscfPort = it }
             }
         }
         Spacer(modifier = Modifier.height(6.dp))
-        OutlinedField("Explicit P-CSCF FQDN (Optional, e.g. pcscf.ims.net)", pcscfFqdn) { pcscfFqdn = it }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(modifier = Modifier.weight(2f)) {
+                OutlinedField("P-CSCF FQDN (for NETWORK_DNS)", pcscfFqdn) { pcscfFqdn = it }
+            }
+            Box(modifier = Modifier.weight(1f)) {
+                OutlinedField("DNS Port", pcscfDnsPort) { pcscfDnsPort = it }
+            }
+        }
 
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -351,6 +399,13 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         // SAVE BUTTON
         Button(
             onClick = {
+                val pcscfConfig = PcscfConfig(
+                    method = pcscfMethod,
+                    preconfiguredHost = pcscfHost.trim(),
+                    preconfiguredPort = pcscfPort.toIntOrNull() ?: 5060,
+                    dnsFqdn = pcscfFqdn.trim(),
+                    dnsPort = pcscfDnsPort.toIntOrNull() ?: 5060
+                )
                 val updated = currentProfile.copy(
                     displayName = displayName.trim(),
                     apnName = apnName.trim(),
@@ -359,9 +414,10 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     mcpttId = mcpttId.trim(),
                     realm = realm.trim(),
                     password = password.trim(),
-                    pcscfHost = pcscfHost.trim(),
-                    pcscfPort = pcscfPort.toIntOrNull() ?: 5060,
-                    pcscfFqdn = pcscfFqdn.trim(),
+                    pcscfConfig = pcscfConfig,
+                    pcscfHost = pcscfConfig.preconfiguredHost,
+                    pcscfPort = pcscfConfig.preconfiguredPort,
+                    pcscfFqdn = pcscfConfig.dnsFqdn,
                     mcpttAsHost = mcpttAsHost.trim(),
                     mcpttAsPort = mcpttAsPort.toIntOrNull() ?: 5060,
                     userAgent = userAgent.trim(),

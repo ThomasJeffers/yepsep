@@ -18,6 +18,23 @@ class McpttRepository(context: Context) {
     val logs: StateFlow<List<SipTrafficLog>> = _logs.asStateFlow()
 
     fun loadProfile(): SipProfile {
+        val methodStr = prefs.getString("pcscf_method", com.example.sip.discovery.PcscfDiscoveryMethod.PRECONFIGURED.name)
+            ?: com.example.sip.discovery.PcscfDiscoveryMethod.PRECONFIGURED.name
+        val method = try {
+            com.example.sip.discovery.PcscfDiscoveryMethod.valueOf(methodStr)
+        } catch (e: Exception) {
+            com.example.sip.discovery.PcscfDiscoveryMethod.PRECONFIGURED
+        }
+
+        val pcscfConfig = com.example.sip.discovery.PcscfConfig(
+            method = method,
+            preconfiguredHost = prefs.getString("pcscf_host", "172.22.0.21") ?: "172.22.0.21",
+            preconfiguredPort = prefs.getInt("pcscf_port", 5060),
+            dnsFqdn = prefs.getString("pcscf_fqdn", "pcscf.ims.mnc070.mcc901.3gppnetwork.org") ?: "pcscf.ims.mnc070.mcc901.3gppnetwork.org",
+            dnsPort = prefs.getInt("pcscf_dns_port", 5060),
+            transport = prefs.getString("transport", "UDP") ?: "UDP"
+        )
+
         return SipProfile(
             displayName = prefs.getString("display_name", "MCPTT UE-1") ?: "MCPTT UE-1",
             apnName = prefs.getString("apn_name", "mcptt") ?: "mcptt",
@@ -26,9 +43,10 @@ class McpttRepository(context: Context) {
             mcpttId = prefs.getString("mcptt_id", "sip:901700000052769@ims.mnc070.mcc901.3gppnetwork.org") ?: "sip:901700000052769@ims.mnc070.mcc901.3gppnetwork.org",
             realm = prefs.getString("realm", "ims.mnc070.mcc901.3gppnetwork.org") ?: "ims.mnc070.mcc901.3gppnetwork.org",
             password = prefs.getString("password", "password123") ?: "password123",
-            pcscfHost = prefs.getString("pcscf_host", "172.30.104.240") ?: "172.30.104.240",
-            pcscfPort = prefs.getInt("pcscf_port", 5060),
-            pcscfFqdn = prefs.getString("pcscf_fqdn", "") ?: "",
+            pcscfConfig = pcscfConfig,
+            pcscfHost = pcscfConfig.preconfiguredHost,
+            pcscfPort = pcscfConfig.preconfiguredPort,
+            pcscfFqdn = pcscfConfig.dnsFqdn,
             scscfOrigRoute = prefs.getString("scscf_orig_route", "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:6060;lr") ?: "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:6060;lr",
             asFallbackUri = prefs.getString("as_fallback_uri", "sip:172.30.104.240:5070;transport=udp") ?: "sip:172.30.104.240:5070;transport=udp",
             userAgent = prefs.getString("user_agent", "MCPTT-Exp5-UAC") ?: "MCPTT-Exp5-UAC",
@@ -44,6 +62,7 @@ class McpttRepository(context: Context) {
     }
 
     fun saveProfile(profile: SipProfile) {
+        val cfg = profile.effectivePcscfConfig
         prefs.edit().apply {
             putString("display_name", profile.displayName)
             putString("apn_name", profile.apnName)
@@ -52,9 +71,11 @@ class McpttRepository(context: Context) {
             putString("mcptt_id", profile.mcpttId)
             putString("realm", profile.realm)
             putString("password", profile.password)
-            putString("pcscf_host", profile.pcscfHost)
-            putInt("pcscf_port", profile.pcscfPort)
-            putString("pcscf_fqdn", profile.pcscfFqdn)
+            putString("pcscf_method", cfg.method.name)
+            putString("pcscf_host", cfg.preconfiguredHost)
+            putInt("pcscf_port", cfg.preconfiguredPort)
+            putString("pcscf_fqdn", cfg.dnsFqdn)
+            putInt("pcscf_dns_port", cfg.dnsPort)
             putString("scscf_orig_route", profile.scscfOrigRoute)
             putString("as_fallback_uri", profile.asFallbackUri)
             putString("user_agent", profile.userAgent)

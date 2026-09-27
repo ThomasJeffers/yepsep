@@ -239,6 +239,18 @@ class McpttApnNetworkManager(
         }
     }
 
+    /**
+     * Retrieves DNS server IP addresses provisioned on the specified Network.
+     */
+    fun getDnsServers(network: Network? = activeNetwork): List<String> {
+        if (cm == null || network == null) return emptyList()
+        return try {
+            cm.getLinkProperties(network)?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
     private fun findLocalIpv4Matching(prefix: String): String? {
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
