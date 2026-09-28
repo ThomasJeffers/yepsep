@@ -1,16 +1,24 @@
 package com.example.sip.discovery
 
+import android.annotation.TargetApi
+import android.net.DnsResolver
 import android.net.Network
+import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.InetAddress
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * Clean client-side abstraction for acquiring and selecting the authoritative P-CSCF endpoint.
@@ -27,6 +35,11 @@ interface PcscfDiscoveryProvider {
      * Resets or initiates the discovery lifecycle to DISCOVERING.
      */
     fun startDiscovery(method: PcscfDiscoveryMethod = PcscfDiscoveryMethod.NETWORK_DNS)
+
+    /**
+     * Reports network disconnection or lost status to prevent staying stuck in DISCOVERING.
+     */
+    fun reportNetworkLost(reason: String)
 
     /**
      * Selects a preconfigured endpoint synchronously if valid.
@@ -88,6 +101,7 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
 
     private val singleFlightMutex = Mutex()
     private var inFlightDeferred: CompletableDeferred<SelectedPcscf>? = null
+    private var inFlightKey: String? = null
     private var lastResolvedKey: String? = null
     private var lastResolvedResult: SelectedPcscf? = null
 
@@ -100,11 +114,26 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
         synchronized(this) {
             lastResolvedKey = null
             lastResolvedResult = null
+            inFlightKey = null
             inFlightDeferred?.cancel()
             inFlightDeferred = null
         }
         _selectedPcscf.value = null
         _discoveryState.value = PcscfDiscoveryState.Discovering(method)
+    }
+
+    override fun reportNetworkLost(reason: String) {
+        synchronized(this) {
+            inFlightDeferred?.cancel()
+            inFlightDeferred = null
+            inFlightKey = null
+            lastResolvedKey = null
+            lastResolvedResult = null
+        }
+        if (_discoveryState.value is PcscfDiscoveryState.Discovering) {
+            _selectedPcscf.value = null
+            _discoveryState.value = PcscfDiscoveryState.Failed("Network unavailable: $reason")
+        }
     }
 
     override fun selectPreconfiguredImmediately(config: PcscfConfig): SelectedPcscf {
@@ -158,11 +187,24 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
 
             val existing = inFlightDeferred
             if (existing != null && existing.isActive) {
-                Log.d(TAG, "P-CSCF discovery: joining in-flight job for key $cacheKey")
-                deferredToAwait = existing
+                if (inFlightKey != cacheKey) {
+                    Log.i(TAG, "Cancelling stale in-flight discovery deferred for previous key $inFlightKey (new key $cacheKey)")
+                    existing.cancel()
+                    inFlightDeferred = null
+                    inFlightKey = null
+                    val newDeferred = CompletableDeferred<SelectedPcscf>()
+                    inFlightDeferred = newDeferred
+                    inFlightKey = cacheKey
+                    deferredToAwait = newDeferred
+                    shouldExecute = true
+                } else {
+                    Log.d(TAG, "P-CSCF discovery: joining in-flight job for key $cacheKey")
+                    deferredToAwait = existing
+                }
             } else {
                 val newDeferred = CompletableDeferred<SelectedPcscf>()
                 inFlightDeferred = newDeferred
+                inFlightKey = cacheKey
                 deferredToAwait = newDeferred
                 shouldExecute = true
             }
@@ -180,13 +222,19 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
             singleFlightMutex.withLock {
                 lastResolvedKey = cacheKey
                 lastResolvedResult = result
-                inFlightDeferred = null
+                if (inFlightDeferred === deferredToAwait) {
+                    inFlightDeferred = null
+                    inFlightKey = null
+                }
             }
             deferredToAwait!!.complete(result)
             result
         } catch (e: Throwable) {
             singleFlightMutex.withLock {
-                inFlightDeferred = null
+                if (inFlightDeferred === deferredToAwait) {
+                    inFlightDeferred = null
+                    inFlightKey = null
+                }
             }
             deferredToAwait!!.completeExceptionally(e)
             throw e
@@ -279,7 +327,7 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
                 val addresses: Array<InetAddress> = if (dnsResolver != null) {
                     dnsResolver!!.invoke(network, fqdn)
                 } else if (network != null) {
-                    network.getAllByName(fqdn)
+                    resolveNetworkDns(network, fqdn)
                 } else {
                     Log.w(TAG, "No MCPTT Network instance available for network-bound DNS resolution")
                     emptyArray()
@@ -344,72 +392,83 @@ class DefaultPcscfDiscoveryProvider : PcscfDiscoveryProvider {
                 candidatesEvaluated = sorted,
                 statusDetail = "Resolved ${candidates.size} address(es) for FQDN '$fqdn' via MCPTT cellular DNS"
             )
-            Log.i(TAG, "P-CSCF discovery result=DNS_RESOLVED ${selection.endpoint.toHostPort()}")
+            Log.i(TAG, "DNS_RESOLVED: P-CSCF discovery result=DNS_RESOLVED ${selection.endpoint.toHostPort()}")
             _selectedPcscf.value = selection
             _discoveryState.value = PcscfDiscoveryState.DnsResolved(selection, fqdn)
         } else {
-            // Fall back to preconfigured P-CSCF only if a preconfigured fallback host is provisioned
+            // DNS resolution failed: NETWORK_DNS requires explicit DNS_FAILED / ERROR without automatic fallback
             val reason = failureReason ?: "DNS resolution failed"
-            val rawFallbackHost = config.preconfiguredHost.trim()
-
-            if (rawFallbackHost.isNotEmpty()) {
-                Log.i(TAG, "P-CSCF fallback selected because=$reason")
-
-                val fallbackBase = config.toPreconfiguredEndpoint(source = PcscfDiscoverySource.FALLBACK)
-                val fallbackEndpoint = fallbackBase.copy(
-                    source = PcscfDiscoverySource.FALLBACK,
-                    timestamp = System.currentTimeMillis()
-                )
-
-                selection = SelectedPcscf(
-                    endpoint = fallbackEndpoint,
-                    source = PcscfDiscoverySource.FALLBACK,
-                    isFallback = true,
-                    discoveryMethod = PcscfDiscoveryMethod.NETWORK_DNS,
-                    configuredHost = fqdn,
-                    resolvedAddress = fallbackEndpoint.resolvedIp,
-                    selectedNetwork = network?.toString(),
-                    dnsServers = dnsServers,
-                    failureReason = reason,
-                    networkInfo = network?.toString(),
-                    candidatesEvaluated = emptyList(),
-                    statusDetail = "Fallback to preconfigured P-CSCF: $reason"
-                )
-                Log.i(TAG, "P-CSCF discovery result=FALLBACK ${selection.endpoint.toHostPort()}")
-                _selectedPcscf.value = selection
-                _discoveryState.value = PcscfDiscoveryState.DnsFailed(selection, reason, fallbackEndpoint)
-            } else {
-                Log.w(TAG, "P-CSCF DNS failed ($reason) and no preconfigured fallback host configured")
-                val errorEndpoint = PcscfEndpoint(
-                    host = fqdn,
-                    port = port,
-                    resolvedIp = null,
-                    source = PcscfDiscoverySource.ERROR,
-                    timestamp = System.currentTimeMillis(),
-                    transport = config.transport
-                )
-                selection = SelectedPcscf(
-                    endpoint = errorEndpoint,
-                    source = PcscfDiscoverySource.ERROR,
-                    isFallback = false,
-                    discoveryMethod = PcscfDiscoveryMethod.NETWORK_DNS,
-                    configuredHost = fqdn,
-                    resolvedAddress = null,
-                    selectedNetwork = network?.toString(),
-                    dnsServers = dnsServers,
-                    failureReason = reason,
-                    networkInfo = network?.toString(),
-                    candidatesEvaluated = emptyList(),
-                    statusDetail = "DNS failed and no fallback configured: $reason"
-                )
-                Log.i(TAG, "P-CSCF discovery result=ERROR (no fallback provisioned)")
-                _selectedPcscf.value = null
-                _discoveryState.value = PcscfDiscoveryState.DnsFailed(selection, reason, null)
-            }
+            Log.w(TAG, "P-CSCF DNS failed ($reason) for FQDN '$fqdn'; reporting DNS_FAILED")
+            val errorEndpoint = PcscfEndpoint(
+                host = fqdn,
+                port = port,
+                resolvedIp = null,
+                source = PcscfDiscoverySource.ERROR,
+                timestamp = System.currentTimeMillis(),
+                transport = config.transport
+            )
+            selection = SelectedPcscf(
+                endpoint = errorEndpoint,
+                source = PcscfDiscoverySource.ERROR,
+                isFallback = false,
+                discoveryMethod = PcscfDiscoveryMethod.NETWORK_DNS,
+                configuredHost = fqdn,
+                resolvedAddress = null,
+                selectedNetwork = network?.toString(),
+                dnsServers = dnsServers,
+                failureReason = reason,
+                networkInfo = network?.toString(),
+                candidatesEvaluated = emptyList(),
+                statusDetail = "DNS failed: $reason"
+            )
+            Log.i(TAG, "P-CSCF discovery result=ERROR: $reason")
+            _selectedPcscf.value = null
+            _discoveryState.value = PcscfDiscoveryState.DnsFailed(selection, reason, null)
         }
 
         return selection
     }
+
+    private suspend fun resolveNetworkDns(network: Network, fqdn: String): Array<InetAddress> {
+        return withTimeoutOrNull(5000L) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    resolveWithDnsResolver(network, fqdn)
+                } catch (e: Exception) {
+                    Log.w(TAG, "DnsResolver query failed (${e.message}), falling back to network.getAllByName")
+                    network.getAllByName(fqdn)
+                }
+            } else {
+                network.getAllByName(fqdn)
+            }
+        } ?: run {
+            Log.w(TAG, "DNS resolution timed out after 5000ms for '$fqdn' on network $network")
+            emptyArray()
+        }
+    }
+
+    @TargetApi(Build.VERSION_CODES.Q)
+    private suspend fun resolveWithDnsResolver(network: Network, fqdn: String): Array<InetAddress> =
+        suspendCancellableCoroutine { cont ->
+            val signal = android.os.CancellationSignal()
+            cont.invokeOnCancellation { signal.cancel() }
+            val callback = object : DnsResolver.Callback<List<InetAddress>> {
+                override fun onAnswer(answer: List<InetAddress>, rcode: Int) {
+                    if (cont.isActive) cont.resume(answer.toTypedArray())
+                }
+                override fun onError(error: DnsResolver.DnsException) {
+                    if (cont.isActive) cont.resumeWithException(error)
+                }
+            }
+            DnsResolver.getInstance().query(
+                network,
+                fqdn,
+                DnsResolver.FLAG_EMPTY,
+                Dispatchers.IO.asExecutor(),
+                signal,
+                callback
+            )
+        }
 
     override suspend fun discover(
         network: Network?,

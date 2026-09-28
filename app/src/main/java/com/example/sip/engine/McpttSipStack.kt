@@ -102,8 +102,10 @@ class McpttSipStack(
     // Single-flight discovery state
     private val discoveryMutex = Mutex()
     private var inFlightDiscoveryJob: Job? = null
+    private var inFlightNetwork: Network? = null
+    private var inFlightConfig: PcscfConfig? = null
     private var lastDiscoveredNetwork: Network? = null
-    private var lastDiscoveredConfig: com.example.sip.discovery.PcscfConfig? = null
+    private var lastDiscoveredConfig: PcscfConfig? = null
     private var lastRegisteredEndpoint: PcscfEndpoint? = null
 
     /**
@@ -177,6 +179,7 @@ class McpttSipStack(
 
         // Handle genuine network transitions without destroying the transport unless rebinding fails
         netMgr.onNetworkChanged = { newNet ->
+            Log.i(TAG, "netMgr.onNetworkChanged event: newNetwork=$newNet")
             val socket = sipSocket
             if (socket != null && !socket.isClosed && newNet != null) {
                 val sockId = System.identityHashCode(socket).toString(16)
@@ -188,13 +191,25 @@ class McpttSipStack(
                     recreateSocket()
                 }
             }
+            if (newNet != null) {
+                triggerCoordinatedDiscovery(newNet, force = true)
+            } else {
+                cancelInFlightDiscovery("Network lost")
+            }
         }
 
         netMgr.startMonitoring()
 
+        // Immediate discovery trigger if network is already bound
+        if (netMgr.activeNetwork != null) {
+            Log.i(TAG, "Immediate active network available at start: ${netMgr.activeNetwork}")
+            triggerCoordinatedDiscovery(netMgr.activeNetwork)
+        }
+
         // Observe cellular APN network status to update socket binding and trigger acquisition
         scope.launch {
             netMgr.networkStatus.collect { netStatus ->
+                Log.d(TAG, "netMgr.networkStatus collected: $netStatus activeNetwork=${netMgr.activeNetwork}")
                 when (netStatus) {
                     is ApnNetworkStatus.Bound -> {
                         val socket = sipSocket
@@ -220,6 +235,7 @@ class McpttSipStack(
                     }
                     is ApnNetworkStatus.Disconnected, is ApnNetworkStatus.NoMcpttPdn -> {
                         lastDiscoveredNetwork = null
+                        cancelInFlightDiscovery("Network status: $netStatus")
                         if (_registrationState.value != RegistrationState.UNREGISTERED) {
                             _registrationState.value = RegistrationState.NETWORK_UNAVAILABLE
                         }
@@ -230,19 +246,47 @@ class McpttSipStack(
         }
     }
 
-    private fun triggerCoordinatedDiscovery(network: Network?) {
-        scope.launch {
-            discoveryMutex.withLock {
-                val currentConfig = profile.effectivePcscfConfig
-                val currentSelected = selectedPcscf.value
+    fun cancelInFlightDiscovery(reason: String) {
+        val jobToCancel: Job?
+        synchronized(this) {
+            jobToCancel = inFlightDiscoveryJob
+            inFlightDiscoveryJob = null
+            inFlightNetwork = null
+            inFlightConfig = null
+        }
+        if (jobToCancel?.isActive == true) {
+            Log.i(TAG, "Explicitly cancelling in-flight discovery: $reason")
+            jobToCancel.cancel()
+        }
+        pcscfDiscoveryProvider.reportNetworkLost(reason)
+    }
 
-                // If already resolved for this exact network and configuration, do not repeat discovery unnecessarily
-                val alreadyResolved = lastDiscoveredNetwork == network &&
+    fun triggerCoordinatedDiscovery(network: Network?, force: Boolean = false) {
+        val currentConfig = profile.effectivePcscfConfig
+        val currentSelected = selectedPcscf.value
+        val existingActive = inFlightDiscoveryJob?.isActive == true
+
+        Log.i(
+            TAG,
+            "triggerCoordinatedDiscovery ENTRY: network=$network method=${currentConfig.method} fqdn='${currentConfig.dnsFqdn}' selectedPcscf=${currentSelected?.summary()} existingActive=$existingActive force=$force"
+        )
+
+        scope.launch {
+            var oldJobToCancel: Job? = null
+
+            discoveryMutex.withLock {
+                Log.i(
+                    TAG,
+                    "triggerCoordinatedDiscovery: mutex acquisition SUCCEEDED for network=$network (inFlightNetwork=$inFlightNetwork existingActive=${inFlightDiscoveryJob?.isActive})"
+                )
+
+                // If already resolved for this exact network and configuration, do not repeat unless forced
+                val alreadyResolved = !force &&
+                        lastDiscoveredNetwork == network &&
                         lastDiscoveredConfig == currentConfig &&
                         currentSelected != null &&
                         (currentSelected.source == PcscfDiscoverySource.DNS_RESOLVED ||
-                         currentSelected.source == PcscfDiscoverySource.PRECONFIGURED ||
-                         currentSelected.source == PcscfDiscoverySource.FALLBACK)
+                         currentSelected.source == PcscfDiscoverySource.PRECONFIGURED)
 
                 if (alreadyResolved) {
                     Log.i(TAG, "P-CSCF already resolved for network $network: ${currentSelected?.endpoint?.toHostPort()}")
@@ -254,45 +298,71 @@ class McpttSipStack(
                     return@withLock
                 }
 
-                // If discovery is already in flight for this stack, do not launch a second discovery
+                // If active discovery job exists for a DIFFERENT network or config, cancel stale job
                 if (inFlightDiscoveryJob?.isActive == true) {
-                    Log.i(TAG, "P-CSCF discovery already in flight; awaiting existing discovery job")
-                    inFlightDiscoveryJob?.join()
-                    if (profile.autoRegister && 
-                        _registrationState.value != RegistrationState.REGISTERED && 
-                        _registrationState.value != RegistrationState.REGISTERING) {
-                        register()
+                    if (inFlightNetwork != network || inFlightConfig != currentConfig || force) {
+                        Log.i(TAG, "Cancelling stale discovery job (oldNetwork=$inFlightNetwork newNetwork=$network)")
+                        oldJobToCancel = inFlightDiscoveryJob
+                        inFlightDiscoveryJob = null
+                    } else {
+                        Log.i(TAG, "P-CSCF discovery already in flight for network $network; letting active job run")
+                        return@withLock
                     }
-                    return@withLock
                 }
 
-                val job = launch {
-                    val dnsServers = apnManager?.getDnsServers(network) ?: emptyList()
-                    val result = pcscfDiscoveryProvider.discover(
-                        method = currentConfig.method,
-                        config = currentConfig,
-                        network = network,
-                        dnsServers = dnsServers
-                    )
-                    lastDiscoveredNetwork = network
-                    lastDiscoveredConfig = currentConfig
-                    Log.i(TAG, "P-CSCF discovery completed: result=${result.summary()} source=${result.source}")
+                inFlightNetwork = network
+                inFlightConfig = currentConfig
 
-                    if (profile.autoRegister) {
-                        if (result.source == PcscfDiscoverySource.DNS_RESOLVED ||
-                            result.source == PcscfDiscoverySource.PRECONFIGURED ||
-                            (result.source == PcscfDiscoverySource.FALLBACK && result.isFallback)) {
-                            register()
-                        } else {
-                            Log.w(TAG, "Auto-register aborted: P-CSCF discovery failed with no valid fallback (${result.failureReason})")
-                            _registrationState.value = RegistrationState.REGISTRATION_FAILED
-                            _registrationFailureReason.value = "Discovery failed: ${result.failureReason}"
+                // Launch discovery job on outer scope WITHOUT holding discoveryMutex during execution or awaiting.
+                // Do NOT call join() inside withLock.
+                val newJob = scope.launch {
+                    try {
+                        Log.i(TAG, "BEFORE pcscfDiscoveryProvider.discover() method=${currentConfig.method} network=$network fqdn='${currentConfig.dnsFqdn}'")
+                        val dnsServers = apnManager?.getDnsServers(network) ?: emptyList()
+                        val result = pcscfDiscoveryProvider.discover(
+                            method = currentConfig.method,
+                            config = currentConfig,
+                            network = network,
+                            dnsServers = dnsServers
+                        )
+                        Log.i(TAG, "AFTER pcscfDiscoveryProvider.discover() returned: result=${result.summary()} source=${result.source}")
+                        Log.i(TAG, "triggerCoordinatedDiscovery: discovery result source=${result.source} endpoint=${result.endpoint.toHostPort()} failure=${result.failureReason}")
+                        lastDiscoveredNetwork = network
+                        lastDiscoveredConfig = currentConfig
+
+                        if (profile.autoRegister) {
+                            if (result.source == PcscfDiscoverySource.DNS_RESOLVED ||
+                                result.source == PcscfDiscoverySource.PRECONFIGURED) {
+                                register()
+                            } else {
+                                Log.w(TAG, "Auto-register aborted: P-CSCF discovery failed (${result.failureReason})")
+                                _registrationState.value = RegistrationState.REGISTRATION_FAILED
+                                _registrationFailureReason.value = "Discovery failed: ${result.failureReason}"
+                            }
+                        }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        Log.i(TAG, "triggerCoordinatedDiscovery: P-CSCF discovery CANCELLED for network $network: ${e.message}")
+                        if (pcscfDiscoveryProvider.discoveryState.value is PcscfDiscoveryState.Discovering && inFlightDiscoveryJob == null) {
+                            pcscfDiscoveryProvider.reportNetworkLost("Discovery cancelled: ${e.message}")
+                        }
+                        throw e
+                    } catch (e: Exception) {
+                        Log.e(TAG, "triggerCoordinatedDiscovery: P-CSCF discovery EXCEPTION for network $network: ${e.message}", e)
+                        _registrationState.value = RegistrationState.REGISTRATION_FAILED
+                        _registrationFailureReason.value = "Discovery exception: ${e.message}"
+                    } finally {
+                        discoveryMutex.withLock {
+                            if (inFlightDiscoveryJob === coroutineContext[Job]) {
+                                inFlightDiscoveryJob = null
+                            }
                         }
                     }
                 }
-                inFlightDiscoveryJob = job
-                job.join()
+
+                inFlightDiscoveryJob = newJob
             }
+
+            oldJobToCancel?.cancel()
         }
     }
 
@@ -320,10 +390,10 @@ class McpttSipStack(
                 if (rawHost.isNotEmpty() && (PcscfConfig.isIpv4Literal(rawHost) || rawHost.contains(":"))) {
                     pcscfDiscoveryProvider.selectPreconfiguredImmediately(newProfile.effectivePcscfConfig)
                 } else {
-                    triggerCoordinatedDiscovery(apnManager?.activeNetwork)
+                    triggerCoordinatedDiscovery(apnManager?.activeNetwork, force = true)
                 }
             } else {
-                triggerCoordinatedDiscovery(apnManager?.activeNetwork)
+                triggerCoordinatedDiscovery(apnManager?.activeNetwork, force = true)
             }
         }
     }
@@ -701,6 +771,10 @@ class McpttSipStack(
         val discoveryStateValue = pcscfDiscoveryProvider.discoveryState.value
         if (discoveryStateValue is PcscfDiscoveryState.Discovering) {
             Log.w(TAG, "SIP REGISTER aborted: P-CSCF discovery is currently DISCOVERING")
+            if (inFlightDiscoveryJob?.isActive != true) {
+                Log.i(TAG, "Triggering discovery from register() because state is DISCOVERING but no discovery job is active")
+                triggerCoordinatedDiscovery(apnManager?.activeNetwork)
+            }
             return
         }
 
@@ -709,7 +783,7 @@ class McpttSipStack(
             (selected.endpoint.resolvedIp.isNullOrBlank() && selected.endpoint.host.isBlank())) {
             Log.e(TAG, "SIP REGISTER aborted: No valid P-CSCF endpoint selected by discovery")
             _registrationState.value = RegistrationState.REGISTRATION_FAILED
-            _registrationFailureReason.value = "No valid P-CSCF endpoint selected by discovery (discovery failed or no fallback)"
+            _registrationFailureReason.value = "No valid P-CSCF endpoint selected by discovery (discovery failed or no endpoint)"
             return
         }
 

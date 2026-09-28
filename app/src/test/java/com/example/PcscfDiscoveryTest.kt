@@ -15,10 +15,12 @@ import com.example.sip.engine.SipDestination
 import com.example.sip.engine.SipNextHopResolver
 import com.example.sip.model.SipMessage
 import com.example.sip.model.SipProfile
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -132,7 +134,7 @@ class PcscfDiscoveryTest {
     }
 
     @Test
-    fun testFallbackSelectedOnlyAfterNetworkDnsFailure() = runBlocking {
+    fun testNetworkDnsFailureReportsDnsFailedWithoutAutomaticFallback() = runBlocking {
         val provider = DefaultPcscfDiscoveryProvider()
 
         // DNS returns no addresses (fails)
@@ -150,16 +152,13 @@ class PcscfDiscoveryTest {
         )
 
         assertNotNull(selected)
-        assertEquals("172.22.0.21", selected.host)
-        assertEquals(5060, selected.port)
-        assertEquals(PcscfDiscoverySource.FALLBACK, selected.source)
-        assertEquals(PcscfDiscoverySource.FALLBACK, selected.endpoint.source)
-        assertTrue("Must be marked fallback after discovery failure", selected.isFallback)
+        assertEquals(PcscfDiscoverySource.ERROR, selected.source)
+        assertFalse("Must NOT choose fallback on NETWORK_DNS", selected.isFallback)
         assertNotNull("Failure reason must be documented", selected.failureReason)
         assertTrue(selected.failureReason!!.contains("returned no addresses") || selected.failureReason!!.contains("No active MCPTT network"))
+        assertNull("Selected P-CSCF must be null when DNS fails", provider.selectedPcscf.value)
         assertTrue(provider.discoveryState.value is PcscfDiscoveryState.DnsFailed)
         assertEquals("DNS_FAILED", provider.discoveryState.value.toString())
-        assertSameEndpointAndSource(selected)
     }
 
     @Test
@@ -179,14 +178,10 @@ class PcscfDiscoveryTest {
             )
 
             assertNotNull(selected)
-            assertNotEquals("Blank FQDN must not claim DNS discovery", PcscfDiscoverySource.DNS_RESOLVED, selected.source)
-            assertEquals("172.22.0.21", selected.host)
-            assertEquals(5060, selected.port)
-            assertEquals(PcscfDiscoverySource.FALLBACK, selected.source)
-            assertTrue(selected.isFallback)
+            assertEquals("Blank FQDN on NETWORK_DNS must report ERROR", PcscfDiscoverySource.ERROR, selected.source)
+            assertNull("Selected P-CSCF must be null for blank FQDN", provider.selectedPcscf.value)
             assertEquals("no P-CSCF FQDN provisioned", selected.failureReason)
             assertTrue(provider.discoveryState.value is PcscfDiscoveryState.DnsFailed)
-            assertSameEndpointAndSource(selected)
         }
     }
 
@@ -490,6 +485,167 @@ class PcscfDiscoveryTest {
         assertEquals(0, sentPackets.size)
         assertEquals(RegistrationState.REGISTRATION_FAILED, stack.registrationState.value)
         assertNotNull(stack.registrationFailureReason.value)
+
+        stack.stop()
+    }
+
+    @Test
+    fun testNetworkBindTriggersDiscoveryAndProviderDiscoverIsCalled() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val stack = McpttSipStack()
+        val resolverCalls = AtomicInteger(0)
+
+        (stack.pcscfDiscoveryProvider as DefaultPcscfDiscoveryProvider).dnsResolver = { _, fqdn ->
+            resolverCalls.incrementAndGet()
+            arrayOf(InetAddress.getByName("172.22.0.21"))
+        }
+
+        val profile = SipProfile(
+            pcscfConfig = PcscfConfig(
+                method = PcscfDiscoveryMethod.NETWORK_DNS,
+                dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
+            ),
+            autoRegister = false
+        )
+
+        stack.start(context, profile)
+        assertEquals(0, resolverCalls.get())
+
+        // Trigger discovery explicitly as network bind does
+        stack.triggerCoordinatedDiscovery(null, force = true)
+
+        // Give the coroutine a moment to complete
+        var attempts = 0
+        while (stack.selectedPcscf.value == null && attempts < 20) {
+            delay(50)
+            attempts++
+        }
+
+        assertNotNull("Discovery must resolve P-CSCF endpoint", stack.selectedPcscf.value)
+        assertEquals("172.22.0.21", stack.selectedPcscf.value?.host)
+        assertEquals(PcscfDiscoverySource.DNS_RESOLVED, stack.selectedPcscf.value?.source)
+        assertEquals(1, resolverCalls.get())
+
+        stack.stop()
+    }
+
+    @Test
+    fun testDiscoveryCannotRemainStuckInDiscoveringOnNetworkLoss() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val stack = McpttSipStack()
+
+        val profile = SipProfile(
+            pcscfConfig = PcscfConfig(
+                method = PcscfDiscoveryMethod.NETWORK_DNS,
+                dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
+            ),
+            autoRegister = false
+        )
+
+        stack.start(context, profile)
+        assertTrue(stack.pcscfDiscoveryState.value is PcscfDiscoveryState.Discovering)
+
+        // Explicitly cancel on network loss
+        stack.cancelInFlightDiscovery("Cellular PDN disconnected")
+
+        assertFalse(
+            "StateFlow must NEVER remain stuck at DISCOVERING on network loss",
+            stack.pcscfDiscoveryState.value is PcscfDiscoveryState.Discovering
+        )
+        assertTrue(stack.pcscfDiscoveryState.value is PcscfDiscoveryState.Failed)
+
+        stack.stop()
+    }
+
+    @Test
+    fun testSecondNetworkCancelsFirstNetworkDiscovery() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val stack = McpttSipStack()
+        val firstStarted = CompletableDeferred<Unit>()
+        val firstCancelled = CompletableDeferred<Unit>()
+        val secondFinished = CompletableDeferred<Unit>()
+
+        // Mock resolver with controlled delays to verify cancellation
+        var callCount = 0
+        (stack.pcscfDiscoveryProvider as DefaultPcscfDiscoveryProvider).dnsResolver = { _, _ ->
+            val call = ++callCount
+            if (call == 1) {
+                firstStarted.complete(Unit)
+                try {
+                    delay(2000) // long delay simulating slow network 1
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    firstCancelled.complete(Unit)
+                    throw e
+                }
+                arrayOf(InetAddress.getByName("10.1.1.1"))
+            } else {
+                secondFinished.complete(Unit)
+                arrayOf(InetAddress.getByName("172.22.0.21"))
+            }
+        }
+
+        val profile = SipProfile(
+            pcscfConfig = PcscfConfig(
+                method = PcscfDiscoveryMethod.NETWORK_DNS,
+                dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
+            ),
+            autoRegister = false
+        )
+
+        stack.start(context, profile)
+
+        // Start discovery on network 1
+        stack.triggerCoordinatedDiscovery(null, force = true)
+        firstStarted.await()
+
+        // New network arrives -> must cancel network 1 discovery and start fresh
+        stack.triggerCoordinatedDiscovery(null, force = true)
+
+        secondFinished.await()
+        var attempts = 0
+        while (stack.selectedPcscf.value == null && attempts < 40) {
+            delay(50)
+            attempts++
+        }
+        assertEquals("172.22.0.21", stack.selectedPcscf.value?.host)
+        assertEquals(PcscfDiscoverySource.DNS_RESOLVED, stack.selectedPcscf.value?.source)
+        firstCancelled.await()
+
+        stack.stop()
+    }
+
+    @Test
+    fun testMutexNeverHeldWhileAwaitingDiscoveryJob() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val stack = McpttSipStack()
+        val jobEnteredResolver = CompletableDeferred<Unit>()
+
+        (stack.pcscfDiscoveryProvider as DefaultPcscfDiscoveryProvider).dnsResolver = { _, _ ->
+            jobEnteredResolver.complete(Unit)
+            delay(100)
+            arrayOf(InetAddress.getByName("172.22.0.21"))
+        }
+
+        val profile = SipProfile(
+            pcscfConfig = PcscfConfig(
+                method = PcscfDiscoveryMethod.NETWORK_DNS,
+                dnsFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
+            ),
+            autoRegister = false
+        )
+
+        stack.start(context, profile)
+        stack.triggerCoordinatedDiscovery(null, force = true)
+
+        jobEnteredResolver.await()
+
+        // Calling triggerCoordinatedDiscovery again while job is actively running should not hang on mutex
+        val secondTrigger = async {
+            stack.triggerCoordinatedDiscovery(null, force = false)
+        }
+        withTimeout(500) {
+            secondTrigger.await()
+        }
 
         stack.stop()
     }
