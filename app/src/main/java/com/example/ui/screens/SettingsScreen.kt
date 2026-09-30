@@ -14,12 +14,17 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AltRoute
+import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.CellTower
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -29,6 +34,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -40,6 +46,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
@@ -49,13 +57,13 @@ import androidx.compose.ui.unit.sp
 import com.example.sip.discovery.PcscfConfig
 import com.example.sip.discovery.PcscfDiscoveryMethod
 import com.example.sip.engine.ApnNetworkStatus
-import com.example.sip.model.SipProfile
 import com.example.ui.McpttViewModel
 import com.example.ui.theme.HighDensityBackground
 import com.example.ui.theme.HighDensityBorder
 import com.example.ui.theme.HighDensityNavy
 import com.example.ui.theme.HighDensitySecondary
 import com.example.ui.theme.HighDensitySurface
+import com.example.ui.theme.HighDensitySurfaceVariant
 import com.example.ui.theme.HighDensityTextPrimary
 import com.example.ui.theme.HighDensityTextSecondary
 import com.example.ui.theme.HighDensityWarning
@@ -95,32 +103,56 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         modifier = Modifier
             .fillMaxSize()
             .background(HighDensityBackground)
-            .padding(14.dp)
+            .padding(16.dp)
             .verticalScroll(rememberScrollState())
     ) {
-        Text(
-            text = "MCPTT APN & IMS SETTINGS",
-            fontSize = 16.sp,
-            fontWeight = FontWeight.Bold,
-            color = HighDensityNavy,
-            fontFamily = FontFamily.Monospace
-        )
-        Text(
-            text = "Aligned with MCPTT-APN-SETUP.md (Path 2: Dedicated mcptt APN, type=default)",
-            fontSize = 11.sp,
-            color = HighDensityTextSecondary
-        )
+        // TOP HEADER
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = HighDensityNavy.copy(alpha = 0.1f),
+                modifier = Modifier.size(36.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Default.Tune,
+                        contentDescription = null,
+                        tint = HighDensityNavy,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column {
+                Text(
+                    text = "RADIO CONFIGURATION",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Black,
+                    color = HighDensityNavy,
+                    letterSpacing = 0.5.sp
+                )
+                Text(
+                    text = "Mission Critical Comms Profile & Network Settings",
+                    fontSize = 11.sp,
+                    color = HighDensityTextSecondary
+                )
+            }
+        }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
-        // NETWORK ADVISORY & APN STATUS CARD
+        // NETWORK ADVISORY & STATUS
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
-            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityNavy),
-            shape = RoundedCornerShape(12.dp)
+            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            shape = RoundedCornerShape(14.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
+            Column(modifier = Modifier.padding(14.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Default.CellTower,
@@ -130,38 +162,47 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                             is ApnNetworkStatus.NoMcpttPdn -> HighDensityWarning
                             else -> HighDensityNavy
                         },
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "CURRENT BINDING: ${netStatus.displaySummary()}",
+                        text = "CELLULAR INTERFACE STATUS",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
+                        color = HighDensityNavy,
+                        letterSpacing = 0.5.sp
+                    )
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = HighDensitySurfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = netStatus.displaySummary(),
+                        fontSize = 11.sp,
                         color = when (netStatus) {
                             is ApnNetworkStatus.Bound -> HighDensitySecondary
                             is ApnNetworkStatus.NoMcpttPdn -> HighDensityWarning
-                            else -> HighDensityNavy
+                            else -> HighDensityTextPrimary
                         },
-                        fontFamily = FontFamily.Monospace
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(8.dp)
                     )
                 }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "SIP and RTP sockets bind to the cellular interface with pool 192.168.102.x. Set the phone's preferred mobile data APN to 'mcptt' (type=default) in SIM settings.",
-                    fontSize = 11.sp,
-                    color = HighDensityTextPrimary
-                )
             }
         }
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // QUICK PRESET BUTTONS
-        Text("QUICK ENVIRONMENT PRESETS", fontSize = 11.sp, color = HighDensityTextSecondary, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+        // QUICK PRESETS
+        SettingsSectionHeader(title = "PRESET CONFIGURATIONS", icon = Icons.Default.FlashOn)
         Spacer(modifier = Modifier.height(6.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Button(
                 onClick = {
@@ -180,10 +221,11 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     scscfOrigRoute = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:5060;lr"
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+                border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityNavy.copy(alpha = 0.4f)),
+                shape = RoundedCornerShape(10.dp),
                 modifier = Modifier.weight(1f)
             ) {
-                Text("UE-1 (IMSI ...123)", fontSize = 10.sp, color = HighDensityTextPrimary, fontWeight = FontWeight.Bold)
+                Text("Tactical Unit 1", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold)
             }
 
             Button(
@@ -203,147 +245,192 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     scscfOrigRoute = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:5060;lr"
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+                border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityNavy.copy(alpha = 0.4f)),
+                shape = RoundedCornerShape(10.dp),
                 modifier = Modifier.weight(1f)
             ) {
-                Text("UE-2 (IMSI ...124)", fontSize = 10.sp, color = HighDensityTextPrimary, fontWeight = FontWeight.Bold)
+                Text("Tactical Unit 2", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold)
             }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // SECTION 1: MCPTT APN (PATH 2)
-        Text("1. MCPTT APN & NETWORK BINDING", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-        Spacer(modifier = Modifier.height(6.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Box(modifier = Modifier.weight(1f)) {
-                OutlinedField("APN Name", apnName) { apnName = it }
-            }
-            Box(modifier = Modifier.weight(1f)) {
-                OutlinedField("APN IPv4 Prefix", apnPrefix) { apnPrefix = it }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // SECTION 2: SIP PROXY / P-CSCF
-        Text("2. P-CSCF ENDPOINT & DISCOVERY METHOD", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-        Text("Select standard-compliant discovery method: PRECONFIGURED (IP or FQDN) or NETWORK_DNS (Cellular Network DNS resolution)", fontSize = 10.sp, color = HighDensityTextSecondary)
-        Spacer(modifier = Modifier.height(6.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            FilterChip(
-                selected = pcscfMethod == PcscfDiscoveryMethod.PRECONFIGURED,
-                onClick = { pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED },
-                label = { Text("PRECONFIGURED", fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace) },
-                colors = FilterChipDefaults.filterChipColors(
-                    selectedContainerColor = HighDensityNavy,
-                    selectedLabelColor = androidx.compose.ui.graphics.Color.White
-                ),
-                modifier = Modifier.weight(1f).testTag("method_preconfigured")
-            )
-            FilterChip(
-                selected = pcscfMethod == PcscfDiscoveryMethod.NETWORK_DNS,
-                onClick = { pcscfMethod = PcscfDiscoveryMethod.NETWORK_DNS },
-                label = { Text("NETWORK_DNS", fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace) },
-                colors = FilterChipDefaults.filterChipColors(
-                    selectedContainerColor = HighDensityNavy,
-                    selectedLabelColor = androidx.compose.ui.graphics.Color.White
-                ),
-                modifier = Modifier.weight(1f).testTag("method_network_dns")
-            )
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Box(modifier = Modifier.weight(2f)) {
-                OutlinedField("Preconfigured Host / IPv4 Literal", pcscfHost) { pcscfHost = it }
-            }
-            Box(modifier = Modifier.weight(1f)) {
-                OutlinedField("Port", pcscfPort) { pcscfPort = it }
-            }
-        }
-        Spacer(modifier = Modifier.height(6.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Box(modifier = Modifier.weight(2f)) {
-                OutlinedField("P-CSCF FQDN (for NETWORK_DNS)", pcscfFqdn) { pcscfFqdn = it }
-            }
-            Box(modifier = Modifier.weight(1f)) {
-                OutlinedField("DNS Port", pcscfDnsPort) { pcscfDnsPort = it }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // SECTION 3: SUBSCRIBER IDENTITY
-        Text("3. SUBSCRIBER & IMS CREDENTIALS", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-        Spacer(modifier = Modifier.height(6.dp))
-        OutlinedField("Display Name / Rank", displayName) { displayName = it }
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedField("IMSI / Auth Username", imsi) {
-            imsi = it
-            mcpttId = "sip:$it@$realm"
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedField("MCPTT IMPU URI", mcpttId) { mcpttId = it }
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedField("IMS Domain / Realm", realm) { realm = it }
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedField("SIP Digest Password", password) { password = it }
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedField("SIP User-Agent", userAgent) { userAgent = it }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // SECTION 4: PORTS & GROUPS
-        Text("4. LOCAL PORTS & TARGET TALKGROUP", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-        Spacer(modifier = Modifier.height(6.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Box(modifier = Modifier.weight(1f)) {
-                OutlinedField("Local SIP Port", localSipPort) { localSipPort = it }
-            }
-            Box(modifier = Modifier.weight(1f)) {
-                OutlinedField("Local RTP Port", localRtpPort) { localRtpPort = it }
-            }
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedField("Target Talkgroup URI", targetGroup) { targetGroup = it }
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedField("S-CSCF Orig-Route URI (exp5_uac)", scscfOrigRoute) { scscfOrigRoute = it }
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedField("MCPTT AS Fallback URI (exp5_uac)", asFallbackUri) { asFallbackUri = it }
-
-        Spacer(modifier = Modifier.height(14.dp))
-
-        // TOGGLES
+        // SECTION 1: OPERATOR & SUBSCRIBER IDENTITY
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
             border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
-            shape = RoundedCornerShape(12.dp)
+            shape = RoundedCornerShape(14.dp)
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                SettingsSectionHeader(title = "OPERATOR & IMS CREDENTIALS", icon = Icons.Default.Badge)
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedField("Display Name / Tactical Call-Sign", displayName) { displayName = it }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedField("IMSI / Auth Username", imsi) {
+                    imsi = it
+                    mcpttId = "sip:$it@$realm"
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedField("MCPTT IMPU URI", mcpttId) { mcpttId = it }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedField("IMS Realm / Domain", realm) { realm = it }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedField("SIP Digest Password", password) { password = it }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedField("SIP User-Agent", userAgent) { userAgent = it }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // SECTION 2: CELLULAR APN & INTERFACE
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                SettingsSectionHeader(title = "CELLULAR APN & LOCAL SOCKETS", icon = Icons.Default.CellTower)
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        OutlinedField("APN Name", apnName) { apnName = it }
+                    }
+                    Box(modifier = Modifier.weight(1f)) {
+                        OutlinedField("IPv4 Subnet Prefix", apnPrefix) { apnPrefix = it }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        OutlinedField("Local SIP Port", localSipPort) { localSipPort = it }
+                    }
+                    Box(modifier = Modifier.weight(1f)) {
+                        OutlinedField("Local RTP Port", localRtpPort) { localRtpPort = it }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // SECTION 3: P-CSCF CORE DISCOVERY
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                SettingsSectionHeader(title = "P-CSCF PROXY DISCOVERY", icon = Icons.Default.Dns)
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Select discovery mechanism across cellular radio interface:",
+                    fontSize = 11.sp,
+                    color = HighDensityTextSecondary
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = pcscfMethod == PcscfDiscoveryMethod.PRECONFIGURED,
+                        onClick = { pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED },
+                        label = { Text("PRECONFIGURED", fontSize = 11.sp, fontWeight = FontWeight.Bold) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = HighDensityNavy,
+                            selectedLabelColor = Color.White
+                        ),
+                        modifier = Modifier.weight(1f).testTag("method_preconfigured")
+                    )
+                    FilterChip(
+                        selected = pcscfMethod == PcscfDiscoveryMethod.NETWORK_DNS,
+                        onClick = { pcscfMethod = PcscfDiscoveryMethod.NETWORK_DNS },
+                        label = { Text("NETWORK_DNS", fontSize = 11.sp, fontWeight = FontWeight.Bold) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = HighDensityNavy,
+                            selectedLabelColor = Color.White
+                        ),
+                        modifier = Modifier.weight(1f).testTag("method_network_dns")
+                    )
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(modifier = Modifier.weight(2f)) {
+                        OutlinedField("Preconfigured Host / IP", pcscfHost) { pcscfHost = it }
+                    }
+                    Box(modifier = Modifier.weight(1f)) {
+                        OutlinedField("Port", pcscfPort) { pcscfPort = it }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(modifier = Modifier.weight(2f)) {
+                        OutlinedField("P-CSCF FQDN (DNS)", pcscfFqdn) { pcscfFqdn = it }
+                    }
+                    Box(modifier = Modifier.weight(1f)) {
+                        OutlinedField("DNS Port", pcscfDnsPort) { pcscfDnsPort = it }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // SECTION 4: TALKGROUP & ROUTING
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                SettingsSectionHeader(title = "TALKGROUP & S-CSCF ROUTING", icon = Icons.Default.AltRoute)
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedField("Target Talkgroup URI", targetGroup) { targetGroup = it }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedField("S-CSCF Orig-Route URI", scscfOrigRoute) { scscfOrigRoute = it }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedField("MCPTT AS Fallback URI", asFallbackUri) { asFallbackUri = it }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // SECTION 5: OPERATIONAL TOGGLES
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                SettingsSectionHeader(title = "OPERATIONAL POLICIES", icon = Icons.Default.Tune)
+                Spacer(modifier = Modifier.height(10.dp))
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Column {
-                        Text("Auto Register on Start", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = HighDensityTextPrimary)
-                        Text("Sends REGISTER immediately when app starts", fontSize = 11.sp, color = HighDensityTextSecondary)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Auto-Register on Launch", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = HighDensityTextPrimary)
+                        Text("Initiates registration sequence upon radio startup", fontSize = 11.sp, color = HighDensityTextSecondary)
                     }
                     Switch(
                         checked = autoRegister,
@@ -359,9 +446,9 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text("Inject +g.3gpp.mcptt Tags", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = HighDensityTextPrimary)
-                        Text("Adds feature tag to Contact / Accept-Contact", fontSize = 11.sp, color = HighDensityTextSecondary)
+                        Text("Includes MCPTT 3GPP feature tags in SIP headers", fontSize = 11.sp, color = HighDensityTextSecondary)
                     }
                     Switch(
                         checked = includeMcpttTags,
@@ -377,9 +464,9 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Column {
-                        Text("Auto Grant Floor (Debug Mode)", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = HighDensityTextPrimary)
-                        Text("Instantly grants floor locally on 200 OK", fontSize = 11.sp, color = HighDensityTextSecondary)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Auto-Grant Floor (Simulation)", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = HighDensityTextPrimary)
+                        Text("Locally grants floor immediately on 200 OK", fontSize = 11.sp, color = HighDensityTextSecondary)
                     }
                     Switch(
                         checked = autoGrantFloor,
@@ -427,21 +514,42 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     autoGrantFloor = autoGrantFloor
                 )
                 viewModel.updateProfile(updated)
-                Toast.makeText(context, "MCPTT APN Settings Saved & Reloaded", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Radio Profile & APN Configuration Saved", Toast.LENGTH_SHORT).show()
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(48.dp)
+                .height(50.dp)
                 .testTag("save_settings_button"),
             colors = ButtonDefaults.buttonColors(containerColor = HighDensityNavy),
-            shape = RoundedCornerShape(10.dp)
+            shape = RoundedCornerShape(12.dp),
+            elevation = ButtonDefaults.buttonElevation(defaultElevation = 2.dp)
         ) {
-            Icon(Icons.Default.Save, contentDescription = null, tint = androidx.compose.ui.graphics.Color.White)
+            Icon(Icons.Default.Save, contentDescription = null, tint = Color.White)
             Spacer(modifier = Modifier.width(8.dp))
-            Text("SAVE & BIND NETWORK", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            Text("SAVE & APPLY CONFIGURATION", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.White)
         }
 
         Spacer(modifier = Modifier.height(24.dp))
+    }
+}
+
+@Composable
+fun SettingsSectionHeader(title: String, icon: ImageVector) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = HighDensityNavy,
+            modifier = Modifier.size(16.dp)
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = title,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            color = HighDensityNavy,
+            letterSpacing = 0.5.sp
+        )
     }
 }
 
@@ -460,6 +568,7 @@ fun OutlinedField(label: String, value: String, onValueChange: (String) -> Unit)
             focusedTextColor = HighDensityTextPrimary,
             unfocusedTextColor = HighDensityTextPrimary
         ),
+        shape = RoundedCornerShape(10.dp),
         singleLine = true
     )
 }
