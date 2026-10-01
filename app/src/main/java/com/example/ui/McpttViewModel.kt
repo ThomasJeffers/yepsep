@@ -6,7 +6,10 @@ import android.content.Intent
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.McpttPreset
 import com.example.data.McpttRepository
+import com.example.data.PresetManager
+import com.example.data.TacticalMessagingRepository
 import com.example.sip.engine.ApnNetworkStatus
 import com.example.sip.engine.CallSessionState
 import com.example.sip.engine.FloorState
@@ -59,6 +62,9 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
         sipStack.apnManager?.networkStatus ?: MutableStateFlow(ApnNetworkStatus.Scanning)
 
     val allLogs: StateFlow<List<SipTrafficLog>> = repository.logs
+
+    val messagingRepo = TacticalMessagingRepository(application)
+    val presetManager = PresetManager(application)
 
     private val _logFilter = MutableStateFlow("ALL")
     val logFilter: StateFlow<String> = _logFilter.asStateFlow()
@@ -174,6 +180,17 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             sipStack.trafficLogs.collect { log ->
                 repository.addLog(log)
+            }
+        }
+
+        viewModelScope.launch {
+            sipStack.incomingMessages.collect { list ->
+                val last = list.lastOrNull() ?: return@collect
+                messagingRepo.addIncomingMessage(
+                    senderUri = last.from,
+                    text = last.text,
+                    targetGroupUri = sipProfile.value.targetGroup
+                )
             }
         }
     }
@@ -326,7 +343,46 @@ class McpttViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendTextMessage(targetUri: String, text: String) {
-        sipStack.sendSipMessageText(targetUri, text)
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        sipStack.sendSipMessageText(targetUri, trimmed)
+        val profile = sipProfile.value
+        messagingRepo.addOutgoingMessage(
+            conversationId = targetUri,
+            text = trimmed,
+            senderName = profile.displayName,
+            senderCallsign = profile.displayName.takeLast(4).uppercase()
+        )
+    }
+
+    fun applyPreset(preset: McpttPreset) {
+        val updated = presetManager.toSipProfile(preset, sipProfile.value)
+        updateProfile(updated)
+    }
+
+    fun savePreset(preset: McpttPreset) {
+        presetManager.savePreset(preset)
+    }
+
+    fun createPreset(name: String) {
+        val newPreset = presetManager.createPresetFrom(name, sipProfile.value)
+        presetManager.selectPreset(newPreset.id)
+    }
+
+    fun deletePreset(id: String): Boolean {
+        return presetManager.deletePreset(id)
+    }
+
+    fun selectPreset(id: String) {
+        presetManager.selectPreset(id)
+    }
+
+    fun selectConversation(id: String) {
+        messagingRepo.selectConversation(id)
+    }
+
+    fun createConversation(targetUri: String, title: String, isGroup: Boolean) {
+        messagingRepo.createConversation(targetUri, title, isGroup)
     }
 
     fun setLogFilter(filter: String) {

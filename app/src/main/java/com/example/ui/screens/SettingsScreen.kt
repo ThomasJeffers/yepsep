@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.widget.Toast
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,18 +14,25 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AltRoute
 import androidx.compose.material.icons.filled.Badge
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.CellTower
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -32,13 +40,16 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -54,25 +65,30 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.McpttPreset
 import com.example.sip.discovery.PcscfConfig
 import com.example.sip.discovery.PcscfDiscoveryMethod
 import com.example.sip.engine.ApnNetworkStatus
 import com.example.ui.McpttViewModel
-import com.example.ui.theme.HighDensityBackground
-import com.example.ui.theme.HighDensityBorder
-import com.example.ui.theme.HighDensityNavy
+import com.example.ui.theme.HighDensityEmergency
 import com.example.ui.theme.HighDensitySecondary
-import com.example.ui.theme.HighDensitySurface
-import com.example.ui.theme.HighDensitySurfaceVariant
 import com.example.ui.theme.HighDensityTextPrimary
 import com.example.ui.theme.HighDensityTextSecondary
 import com.example.ui.theme.HighDensityWarning
+import com.example.ui.theme.TacticalConsoleDark
+import com.example.ui.theme.TacticalCyanGlow
+import com.example.ui.theme.TacticalHairlineBorder
+import com.example.ui.theme.TacticalPlateInset
+import com.example.ui.theme.TacticalPlateRaised
+import com.example.ui.theme.TacticalPlateSurface
 
 @Composable
 fun SettingsScreen(viewModel: McpttViewModel) {
     val context = LocalContext.current
     val currentProfile by viewModel.sipProfile.collectAsState()
     val netStatus by viewModel.apnNetworkStatus.collectAsState()
+    val presets by viewModel.presetManager.presets.collectAsState()
+    val selectedPresetId by viewModel.presetManager.selectedPresetId.collectAsState()
 
     var displayName by remember(currentProfile) { mutableStateOf(currentProfile.displayName) }
     var apnName by remember(currentProfile) { mutableStateOf(currentProfile.apnName) }
@@ -99,11 +115,38 @@ fun SettingsScreen(viewModel: McpttViewModel) {
     var includeMcpttTags by remember(currentProfile) { mutableStateOf(currentProfile.includeMcpttTags) }
     var autoGrantFloor by remember(currentProfile) { mutableStateOf(currentProfile.autoGrantFloor) }
 
+    var showNewPresetDialog by remember { mutableStateOf(false) }
+    var showDeleteConfirmDialog by remember { mutableStateOf(false) }
+
+    val activePreset = presets.find { it.id == selectedPresetId }
+
+    // Helper to load preset into form
+    fun loadPresetToForm(p: McpttPreset) {
+        displayName = p.displayName
+        imsi = p.imsi
+        mcpttId = p.mcpttId
+        realm = p.realm
+        password = p.password
+        pcscfMethod = p.pcscfMethod
+        pcscfHost = p.pcscfHost
+        pcscfPort = p.pcscfPort.toString()
+        pcscfFqdn = p.pcscfFqdn
+        pcscfDnsPort = p.pcscfDnsPort.toString()
+        apnName = p.apnName
+        apnPrefix = p.apnPrefix
+        localSipPort = p.localSipPort.toString()
+        localRtpPort = p.localRtpPort.toString()
+        targetGroup = p.targetGroup
+        scscfOrigRoute = p.scscfOrigRoute
+        asFallbackUri = p.asFallbackUri
+        userAgent = p.userAgent
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(HighDensityBackground)
-            .padding(16.dp)
+            .background(TacticalConsoleDark)
+            .padding(14.dp)
             .verticalScroll(rememberScrollState())
     ) {
         // TOP HEADER
@@ -113,14 +156,15 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         ) {
             Surface(
                 shape = CircleShape,
-                color = HighDensityNavy.copy(alpha = 0.1f),
+                color = TacticalPlateRaised,
+                border = androidx.compose.foundation.BorderStroke(1.dp, TacticalCyanGlow.copy(alpha = 0.5f)),
                 modifier = Modifier.size(36.dp)
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
                         imageVector = Icons.Default.Tune,
                         contentDescription = null,
-                        tint = HighDensityNavy,
+                        tint = TacticalCyanGlow,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -128,14 +172,15 @@ fun SettingsScreen(viewModel: McpttViewModel) {
             Spacer(modifier = Modifier.width(12.dp))
             Column {
                 Text(
-                    text = "RADIO CONFIGURATION",
-                    fontSize = 16.sp,
+                    text = "RADIO PROFILE & PRESETS",
+                    fontSize = 15.sp,
                     fontWeight = FontWeight.Black,
-                    color = HighDensityNavy,
-                    letterSpacing = 0.5.sp
+                    color = Color.White,
+                    fontFamily = FontFamily.Monospace,
+                    letterSpacing = 0.6.sp
                 )
                 Text(
-                    text = "Mission Critical Comms Profile & Network Settings",
+                    text = "Tactical Presets, APN Binding & Core Configuration",
                     fontSize = 11.sp,
                     color = HighDensityTextSecondary
                 )
@@ -144,15 +189,223 @@ fun SettingsScreen(viewModel: McpttViewModel) {
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // NETWORK ADVISORY & STATUS
+        // ==========================================
+        // EDITABLE PRESETS MANAGER SECTION
+        // ==========================================
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
-            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
-            shape = RoundedCornerShape(14.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+            colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
+            shape = RoundedCornerShape(14.dp)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Bookmark,
+                            contentDescription = null,
+                            tint = TacticalCyanGlow,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "RADIO PRESET PROFILES",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TacticalCyanGlow,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    // "+ NEW PRESET" Button
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = TacticalPlateRaised,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
+                        modifier = Modifier.padding(2.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            IconButton(
+                                onClick = { showNewPresetDialog = true },
+                                modifier = Modifier.size(20.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Add,
+                                    contentDescription = "New Preset",
+                                    tint = TacticalCyanGlow,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                            Text(
+                                text = "NEW PRESET",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = TacticalCyanGlow
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Scrollable Preset Chips
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    items(presets) { preset ->
+                        val isSelected = preset.id == selectedPresetId
+                        FilterChip(
+                            selected = isSelected,
+                            onClick = {
+                                viewModel.selectPreset(preset.id)
+                                loadPresetToForm(preset)
+                                Toast.makeText(context, "Loaded preset: ${preset.name}", Toast.LENGTH_SHORT).show()
+                            },
+                            label = {
+                                Text(
+                                    text = preset.name,
+                                    fontSize = 11.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = TacticalCyanGlow,
+                                selectedLabelColor = Color.White,
+                                containerColor = TacticalPlateRaised,
+                                labelColor = HighDensityTextPrimary
+                            ),
+                            border = FilterChipDefaults.filterChipBorder(
+                                enabled = true,
+                                selected = isSelected,
+                                borderColor = if (isSelected) TacticalCyanGlow else TacticalHairlineBorder
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Active Preset Action Controls: Apply, Save to Preset, Delete
+                activePreset?.let { p ->
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = TacticalPlateInset,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Text(
+                                text = "Active Preset: ${p.name}",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                            if (p.description.isNotBlank()) {
+                                Text(
+                                    text = p.description,
+                                    fontSize = 10.sp,
+                                    color = HighDensityTextSecondary
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                // Apply Preset to Radio
+                                Button(
+                                    onClick = {
+                                        viewModel.applyPreset(p)
+                                        Toast.makeText(context, "Applied ${p.name} to Radio Stack", Toast.LENGTH_SHORT).show()
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = HighDensitySecondary),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.weight(1f).height(38.dp)
+                                ) {
+                                    Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("APPLY", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+
+                                // Save Changes to This Preset
+                                Button(
+                                    onClick = {
+                                        val updatedPreset = p.copy(
+                                            displayName = displayName.trim(),
+                                            imsi = imsi.trim(),
+                                            mcpttId = mcpttId.trim(),
+                                            realm = realm.trim(),
+                                            password = password.trim(),
+                                            pcscfMethod = pcscfMethod,
+                                            pcscfHost = pcscfHost.trim(),
+                                            pcscfPort = pcscfPort.toIntOrNull() ?: 5060,
+                                            pcscfFqdn = pcscfFqdn.trim(),
+                                            pcscfDnsPort = pcscfDnsPort.toIntOrNull() ?: 5060,
+                                            apnName = apnName.trim(),
+                                            apnPrefix = apnPrefix.trim(),
+                                            localSipPort = localSipPort.toIntOrNull() ?: 5062,
+                                            localRtpPort = localRtpPort.toIntOrNull() ?: 6000,
+                                            targetGroup = targetGroup.trim(),
+                                            scscfOrigRoute = scscfOrigRoute.trim(),
+                                            asFallbackUri = asFallbackUri.trim(),
+                                            userAgent = userAgent.trim()
+                                        )
+                                        viewModel.savePreset(updatedPreset)
+                                        Toast.makeText(context, "Saved changes to ${p.name}", Toast.LENGTH_SHORT).show()
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = TacticalCyanGlow),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.weight(1.3f).height(38.dp)
+                                ) {
+                                    Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("SAVE TO PRESET", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                }
+
+                                // Delete Preset
+                                IconButton(
+                                    onClick = { showDeleteConfirmDialog = true },
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .background(HighDensityEmergency.copy(alpha = 0.2f), RoundedCornerShape(8.dp))
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = "Delete Preset",
+                                        tint = HighDensityEmergency,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // NETWORK ADVISORY & INTERFACE STATUS CARD
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Default.CellTower,
@@ -160,23 +413,23 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                         tint = when (netStatus) {
                             is ApnNetworkStatus.Bound -> HighDensitySecondary
                             is ApnNetworkStatus.NoMcpttPdn -> HighDensityWarning
-                            else -> HighDensityNavy
+                            else -> TacticalCyanGlow
                         },
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "CELLULAR INTERFACE STATUS",
+                        text = "CELLULAR BEARER STATUS",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        color = HighDensityNavy,
-                        letterSpacing = 0.5.sp
+                        color = TacticalCyanGlow,
+                        fontFamily = FontFamily.Monospace
                     )
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Surface(
                     shape = RoundedCornerShape(8.dp),
-                    color = HighDensitySurfaceVariant,
+                    color = TacticalPlateInset,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
@@ -197,88 +450,30 @@ fun SettingsScreen(viewModel: McpttViewModel) {
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // QUICK PRESETS
-        SettingsSectionHeader(title = "PRESET CONFIGURATIONS", icon = Icons.Default.FlashOn)
-        Spacer(modifier = Modifier.height(6.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Button(
-                onClick = {
-                    imsi = "491234567890123"
-                    displayName = "MCPTT UE-1"
-                    mcpttId = "sip:491234567890123@ims.mnc070.mcc901.3gppnetwork.org"
-                    pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED
-                    pcscfPort = "5060"
-                    pcscfFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
-                    pcscfDnsPort = "5060"
-                    apnName = "mcptt"
-                    apnPrefix = "192.168.102."
-                    localSipPort = "5062"
-                    localRtpPort = "6000"
-                    targetGroup = "sip:group1@ims.mnc070.mcc901.3gppnetwork.org"
-                    scscfOrigRoute = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:5060;lr"
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityNavy.copy(alpha = 0.4f)),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Tactical Unit 1", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold)
-            }
-
-            Button(
-                onClick = {
-                    imsi = "491234567890124"
-                    displayName = "MCPTT UE-2"
-                    mcpttId = "sip:491234567890124@ims.mnc070.mcc901.3gppnetwork.org"
-                    pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED
-                    pcscfPort = "5060"
-                    pcscfFqdn = "pcscf.ims.mnc070.mcc901.3gppnetwork.org"
-                    pcscfDnsPort = "5060"
-                    apnName = "mcptt"
-                    apnPrefix = "192.168.102."
-                    localSipPort = "5064"
-                    localRtpPort = "6004"
-                    targetGroup = "sip:group1@ims.mnc070.mcc901.3gppnetwork.org"
-                    scscfOrigRoute = "sip:orig@scscf.ims.mnc070.mcc901.3gppnetwork.org:5060;lr"
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = HighDensitySurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityNavy.copy(alpha = 0.4f)),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Tactical Unit 2", fontSize = 11.sp, color = HighDensityNavy, fontWeight = FontWeight.Bold)
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
         // SECTION 1: OPERATOR & SUBSCRIBER IDENTITY
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
-            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
             shape = RoundedCornerShape(14.dp)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
                 SettingsSectionHeader(title = "OPERATOR & IMS CREDENTIALS", icon = Icons.Default.Badge)
                 Spacer(modifier = Modifier.height(10.dp))
-                OutlinedField("Display Name / Tactical Call-Sign", displayName) { displayName = it }
+                TacticalOutlinedField("Display Name / Tactical Call-Sign", displayName) { displayName = it }
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedField("IMSI / Auth Username", imsi) {
+                TacticalOutlinedField("IMSI / Auth Username", imsi) {
                     imsi = it
                     mcpttId = "sip:$it@$realm"
                 }
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedField("MCPTT IMPU URI", mcpttId) { mcpttId = it }
+                TacticalOutlinedField("MCPTT IMPU URI", mcpttId) { mcpttId = it }
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedField("IMS Realm / Domain", realm) { realm = it }
+                TacticalOutlinedField("IMS Realm / Domain", realm) { realm = it }
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedField("SIP Digest Password", password) { password = it }
+                TacticalOutlinedField("SIP Digest Password", password) { password = it }
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedField("SIP User-Agent", userAgent) { userAgent = it }
+                TacticalOutlinedField("SIP User-Agent", userAgent) { userAgent = it }
             }
         }
 
@@ -287,8 +482,8 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         // SECTION 2: CELLULAR APN & INTERFACE
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
-            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
             shape = RoundedCornerShape(14.dp)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
@@ -299,10 +494,10 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Box(modifier = Modifier.weight(1f)) {
-                        OutlinedField("APN Name", apnName) { apnName = it }
+                        TacticalOutlinedField("APN Name", apnName) { apnName = it }
                     }
                     Box(modifier = Modifier.weight(1f)) {
-                        OutlinedField("IPv4 Subnet Prefix", apnPrefix) { apnPrefix = it }
+                        TacticalOutlinedField("IPv4 Subnet Prefix", apnPrefix) { apnPrefix = it }
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
@@ -311,10 +506,10 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Box(modifier = Modifier.weight(1f)) {
-                        OutlinedField("Local SIP Port", localSipPort) { localSipPort = it }
+                        TacticalOutlinedField("Local SIP Port", localSipPort) { localSipPort = it }
                     }
                     Box(modifier = Modifier.weight(1f)) {
-                        OutlinedField("Local RTP Port", localRtpPort) { localRtpPort = it }
+                        TacticalOutlinedField("Local RTP Port", localRtpPort) { localRtpPort = it }
                     }
                 }
             }
@@ -325,15 +520,15 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         // SECTION 3: P-CSCF CORE DISCOVERY
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
-            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
             shape = RoundedCornerShape(14.dp)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
                 SettingsSectionHeader(title = "P-CSCF PROXY DISCOVERY", icon = Icons.Default.Dns)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Select discovery mechanism across cellular radio interface:",
+                    text = "Select 3GPP discovery method across MCPTT cellular network:",
                     fontSize = 11.sp,
                     color = HighDensityTextSecondary
                 )
@@ -345,20 +540,24 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     FilterChip(
                         selected = pcscfMethod == PcscfDiscoveryMethod.PRECONFIGURED,
                         onClick = { pcscfMethod = PcscfDiscoveryMethod.PRECONFIGURED },
-                        label = { Text("PRECONFIGURED", fontSize = 11.sp, fontWeight = FontWeight.Bold) },
+                        label = { Text("PRECONFIGURED", fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace) },
                         colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = HighDensityNavy,
-                            selectedLabelColor = Color.White
+                            selectedContainerColor = TacticalCyanGlow,
+                            selectedLabelColor = Color.White,
+                            containerColor = TacticalPlateRaised,
+                            labelColor = HighDensityTextPrimary
                         ),
                         modifier = Modifier.weight(1f).testTag("method_preconfigured")
                     )
                     FilterChip(
                         selected = pcscfMethod == PcscfDiscoveryMethod.NETWORK_DNS,
                         onClick = { pcscfMethod = PcscfDiscoveryMethod.NETWORK_DNS },
-                        label = { Text("NETWORK_DNS", fontSize = 11.sp, fontWeight = FontWeight.Bold) },
+                        label = { Text("NETWORK_DNS", fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace) },
                         colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = HighDensityNavy,
-                            selectedLabelColor = Color.White
+                            selectedContainerColor = TacticalCyanGlow,
+                            selectedLabelColor = Color.White,
+                            containerColor = TacticalPlateRaised,
+                            labelColor = HighDensityTextPrimary
                         ),
                         modifier = Modifier.weight(1f).testTag("method_network_dns")
                     )
@@ -369,10 +568,10 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Box(modifier = Modifier.weight(2f)) {
-                        OutlinedField("Preconfigured Host / IP", pcscfHost) { pcscfHost = it }
+                        TacticalOutlinedField("Preconfigured Host / IP", pcscfHost) { pcscfHost = it }
                     }
                     Box(modifier = Modifier.weight(1f)) {
-                        OutlinedField("Port", pcscfPort) { pcscfPort = it }
+                        TacticalOutlinedField("Port", pcscfPort) { pcscfPort = it }
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
@@ -381,10 +580,10 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Box(modifier = Modifier.weight(2f)) {
-                        OutlinedField("P-CSCF FQDN (DNS)", pcscfFqdn) { pcscfFqdn = it }
+                        TacticalOutlinedField("P-CSCF FQDN (DNS)", pcscfFqdn) { pcscfFqdn = it }
                     }
                     Box(modifier = Modifier.weight(1f)) {
-                        OutlinedField("DNS Port", pcscfDnsPort) { pcscfDnsPort = it }
+                        TacticalOutlinedField("DNS Port", pcscfDnsPort) { pcscfDnsPort = it }
                     }
                 }
             }
@@ -395,18 +594,18 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         // SECTION 4: TALKGROUP & ROUTING
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
-            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
             shape = RoundedCornerShape(14.dp)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
                 SettingsSectionHeader(title = "TALKGROUP & S-CSCF ROUTING", icon = Icons.Default.AltRoute)
                 Spacer(modifier = Modifier.height(10.dp))
-                OutlinedField("Target Talkgroup URI", targetGroup) { targetGroup = it }
+                TacticalOutlinedField("Target Talkgroup URI", targetGroup) { targetGroup = it }
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedField("S-CSCF Orig-Route URI", scscfOrigRoute) { scscfOrigRoute = it }
+                TacticalOutlinedField("S-CSCF Orig-Route URI", scscfOrigRoute) { scscfOrigRoute = it }
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedField("MCPTT AS Fallback URI", asFallbackUri) { asFallbackUri = it }
+                TacticalOutlinedField("MCPTT AS Fallback URI", asFallbackUri) { asFallbackUri = it }
             }
         }
 
@@ -415,8 +614,8 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         // SECTION 5: OPERATIONAL TOGGLES
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = HighDensitySurface),
-            border = androidx.compose.foundation.BorderStroke(1.dp, HighDensityBorder),
+            colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
             shape = RoundedCornerShape(14.dp)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
@@ -435,7 +634,7 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     Switch(
                         checked = autoRegister,
                         onCheckedChange = { autoRegister = it },
-                        colors = SwitchDefaults.colors(checkedThumbColor = HighDensityNavy, checkedTrackColor = HighDensityNavy.copy(alpha = 0.5f))
+                        colors = SwitchDefaults.colors(checkedThumbColor = TacticalCyanGlow, checkedTrackColor = TacticalCyanGlow.copy(alpha = 0.5f))
                     )
                 }
 
@@ -453,7 +652,7 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     Switch(
                         checked = includeMcpttTags,
                         onCheckedChange = { includeMcpttTags = it },
-                        colors = SwitchDefaults.colors(checkedThumbColor = HighDensityNavy, checkedTrackColor = HighDensityNavy.copy(alpha = 0.5f))
+                        colors = SwitchDefaults.colors(checkedThumbColor = TacticalCyanGlow, checkedTrackColor = TacticalCyanGlow.copy(alpha = 0.5f))
                     )
                 }
 
@@ -471,7 +670,7 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                     Switch(
                         checked = autoGrantFloor,
                         onCheckedChange = { autoGrantFloor = it },
-                        colors = SwitchDefaults.colors(checkedThumbColor = HighDensityNavy, checkedTrackColor = HighDensityNavy.copy(alpha = 0.5f))
+                        colors = SwitchDefaults.colors(checkedThumbColor = TacticalCyanGlow, checkedTrackColor = TacticalCyanGlow.copy(alpha = 0.5f))
                     )
                 }
             }
@@ -479,7 +678,7 @@ fun SettingsScreen(viewModel: McpttViewModel) {
 
         Spacer(modifier = Modifier.height(20.dp))
 
-        // SAVE BUTTON
+        // SAVE & APPLY CONFIGURATION BUTTON (Preserving test tag save_settings_button)
         Button(
             onClick = {
                 val pcscfConfig = PcscfConfig(
@@ -518,11 +717,10 @@ fun SettingsScreen(viewModel: McpttViewModel) {
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(50.dp)
+                .height(52.dp)
                 .testTag("save_settings_button"),
-            colors = ButtonDefaults.buttonColors(containerColor = HighDensityNavy),
-            shape = RoundedCornerShape(12.dp),
-            elevation = ButtonDefaults.buttonElevation(defaultElevation = 2.dp)
+            colors = ButtonDefaults.buttonColors(containerColor = TacticalCyanGlow),
+            shape = RoundedCornerShape(12.dp)
         ) {
             Icon(Icons.Default.Save, contentDescription = null, tint = Color.White)
             Spacer(modifier = Modifier.width(8.dp))
@@ -530,6 +728,86 @@ fun SettingsScreen(viewModel: McpttViewModel) {
         }
 
         Spacer(modifier = Modifier.height(24.dp))
+    }
+
+    // Dialog for creating a new preset
+    if (showNewPresetDialog) {
+        var presetNameInput by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showNewPresetDialog = false },
+            title = { Text("CREATE NEW RADIO PRESET", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = HighDensityTextPrimary) },
+            text = {
+                Column {
+                    Text(
+                        text = "Current settings will be cloned into a persistent new radio preset profile:",
+                        fontSize = 11.sp,
+                        color = HighDensityTextSecondary
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = presetNameInput,
+                        onValueChange = { presetNameInput = it },
+                        label = { Text("Preset Profile Name") },
+                        placeholder = { Text("e.g. Tactical Squad 3") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (presetNameInput.isNotBlank()) {
+                            viewModel.createPreset(presetNameInput.trim())
+                            showNewPresetDialog = false
+                            Toast.makeText(context, "Created preset: $presetNameInput", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = TacticalCyanGlow)
+                ) {
+                    Text("CREATE PRESET")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNewPresetDialog = false }) {
+                    Text("CANCEL")
+                }
+            }
+        )
+    }
+
+    // Dialog for confirming preset deletion
+    if (showDeleteConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirmDialog = false },
+            title = { Text("DELETE PRESET PROFILE", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = HighDensityEmergency) },
+            text = {
+                Text("Are you sure you want to delete preset '${activePreset?.name}'? This action cannot be undone.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        activePreset?.let {
+                            val deleted = viewModel.deletePreset(it.id)
+                            if (deleted) {
+                                Toast.makeText(context, "Preset deleted", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "Default preset cannot be deleted", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                        showDeleteConfirmDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = HighDensityEmergency)
+                ) {
+                    Text("DELETE")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirmDialog = false }) {
+                    Text("CANCEL")
+                }
+            }
+        )
     }
 }
 
@@ -539,7 +817,7 @@ fun SettingsSectionHeader(title: String, icon: ImageVector) {
         Icon(
             imageVector = icon,
             contentDescription = null,
-            tint = HighDensityNavy,
+            tint = TacticalCyanGlow,
             modifier = Modifier.size(16.dp)
         )
         Spacer(modifier = Modifier.width(6.dp))
@@ -547,24 +825,25 @@ fun SettingsSectionHeader(title: String, icon: ImageVector) {
             text = title,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
-            color = HighDensityNavy,
-            letterSpacing = 0.5.sp
+            color = TacticalCyanGlow,
+            letterSpacing = 0.5.sp,
+            fontFamily = FontFamily.Monospace
         )
     }
 }
 
 @Composable
-fun OutlinedField(label: String, value: String, onValueChange: (String) -> Unit) {
+fun TacticalOutlinedField(label: String, value: String, onValueChange: (String) -> Unit) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
         label = { Text(label, fontSize = 11.sp, color = HighDensityTextSecondary) },
         modifier = Modifier.fillMaxWidth(),
         colors = OutlinedTextFieldDefaults.colors(
-            focusedContainerColor = HighDensitySurface,
-            unfocusedContainerColor = HighDensitySurface,
-            focusedBorderColor = HighDensityNavy,
-            unfocusedBorderColor = HighDensityBorder,
+            focusedContainerColor = TacticalPlateRaised,
+            unfocusedContainerColor = TacticalPlateRaised,
+            focusedBorderColor = TacticalCyanGlow,
+            unfocusedBorderColor = TacticalHairlineBorder,
             focusedTextColor = HighDensityTextPrimary,
             unfocusedTextColor = HighDensityTextPrimary
         ),
