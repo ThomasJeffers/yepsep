@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Radio
@@ -35,6 +36,7 @@ import com.example.ui.McpttViewModel
 import com.example.ui.screens.GroupsScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.SipInspectorScreen
+import com.example.ui.screens.TacticalMessagesScreen
 import com.example.ui.screens.TacticalPttScreen
 import com.example.ui.theme.HighDensityBackground
 import com.example.ui.theme.HighDensityNavy
@@ -74,9 +76,10 @@ fun MainAppScreen(viewModel: McpttViewModel) {
 
     val navItems = listOf(
         NavItem("PTT Radio", Icons.Default.Radio, "tab_ptt"),
-        NavItem("SIP Inspector", Icons.Default.Code, "tab_inspector"),
         NavItem("Talkgroups", Icons.Default.Group, "tab_groups"),
-        NavItem("Settings", Icons.Default.Settings, "tab_settings")
+        NavItem("Messages", Icons.Default.Chat, "tab_messages"),
+        NavItem("Settings", Icons.Default.Settings, "tab_settings"),
+        NavItem("Inspector", Icons.Default.Code, "tab_inspector")
     )
 
     Scaffold(
@@ -120,9 +123,13 @@ fun MainAppScreen(viewModel: McpttViewModel) {
         Box(modifier = Modifier.padding(innerPadding)) {
             when (selectedTab) {
                 0 -> TacticalPttScreen(viewModel = viewModel)
-                1 -> SipInspectorScreen(viewModel = viewModel)
-                2 -> GroupsScreen(viewModel = viewModel)
-                3 -> SettingsScreen(viewModel = viewModel)
+                1 -> GroupsScreen(viewModel = viewModel)
+                2 -> TacticalMessagesScreen(viewModel = viewModel)
+                3 -> SettingsScreen(
+                    viewModel = viewModel,
+                    onNavigateToTab = { selectedTab = it }
+                )
+                4 -> SipInspectorScreen(viewModel = viewModel)
             }
         }
     }

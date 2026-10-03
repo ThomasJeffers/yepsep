@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -12,18 +11,14 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -32,36 +27,24 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.CellTower
-import androidx.compose.material.icons.filled.Chat
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.ExpandLess
-import androidx.compose.material.icons.filled.ExpandMore
-import androidx.compose.material.icons.filled.Groups
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.FrontHand
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicNone
 import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.Radio
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.RssFeed
-import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -94,7 +77,6 @@ import com.example.sip.engine.FloorState
 import com.example.sip.engine.RegistrationState
 import com.example.ui.McpttViewModel
 import com.example.ui.theme.HighDensityEmergency
-import com.example.ui.theme.HighDensityNavy
 import com.example.ui.theme.HighDensityPttRed
 import com.example.ui.theme.HighDensityPttRedDark
 import com.example.ui.theme.HighDensitySecondary
@@ -113,7 +95,6 @@ import com.example.ui.theme.TacticalPlateSurface
 fun TacticalPttScreen(viewModel: McpttViewModel) {
     val context = LocalContext.current
     val registrationState by viewModel.registrationState.collectAsState()
-    val failureReason by viewModel.registrationFailureReason.collectAsState()
     val callState by viewModel.callState.collectAsState()
     val floorState by viewModel.floorState.collectAsState()
     val activeSpeaker by viewModel.activeSpeaker.collectAsState()
@@ -122,8 +103,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
     val audioLevel by viewModel.micAudioLevel.collectAsState()
 
     var isPttHeld by remember { mutableStateOf(false) }
-    var quickMsgText by remember { mutableStateOf("") }
-    var isMessagingExpanded by remember { mutableStateOf(false) }
+    var isGroupDropdownExpanded by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -160,6 +140,8 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
 
     val isRegistered = registrationState == RegistrationState.REGISTERED
     val isDialogConnected = callState == CallSessionState.CONNECTED
+    val isTransmitting = floorState == FloorState.GRANTED
+    val isReceiving = floorState == FloorState.LISTENING
 
     // PTT button color calculation
     val pttColor by animateColorAsState(
@@ -168,7 +150,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
             floorBusy -> HighDensityEmergency
             floorState == FloorState.GRANTED -> HighDensitySecondary
             floorState == FloorState.REQUESTING -> HighDensityWarning
-            floorState == FloorState.LISTENING -> Color(0xFF1E293B)
+            floorState == FloorState.LISTENING -> Color(0xFF0284C7)
             floorState == FloorState.RELEASING -> Color(0xFF475569)
             else -> if (isPttHeld) HighDensityPttRedDark else HighDensityPttRed
         },
@@ -184,12 +166,14 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 .replaceFirstChar { it.uppercase() }
     }
 
+    val canHoldPtt = isRegistered && floorState != FloorState.LISTENING && !floorBusy
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(TacticalConsoleDark)
     ) {
-        // Subtle Mission Control atmospheric gradient background
+        // Atmospheric Tactical Background Gradient
         Canvas(modifier = Modifier.fillMaxSize()) {
             drawRect(
                 brush = Brush.radialGradient(
@@ -198,446 +182,230 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                         TacticalConsoleDark,
                         TacticalObsidian
                     ),
-                    center = Offset(size.width / 2f, size.height * 0.35f),
-                    radius = size.width * 0.9f
+                    center = Offset(size.width / 2f, size.height * 0.42f),
+                    radius = size.width * 1.15f
                 )
             )
         }
 
+        // Dedicated Operator Handset Interface
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 14.dp, vertical = 10.dp)
-                .verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
         ) {
             // ==========================================
-            // 1. TOP HEADER: MISSION CONSOLE STATUS
+            // 1. MINIMAL TOP BAR: OPERATOR & CONNECTION
             // ==========================================
-            Card(
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .testTag("ims_status_card"),
-                colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
-                shape = RoundedCornerShape(14.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
+                    .padding(top = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 10.dp)
-                ) {
-                    // Top row: App designation & Callsign badge
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Surface(
-                                shape = RoundedCornerShape(6.dp),
-                                color = TacticalPlateRaised,
-                                border = androidx.compose.foundation.BorderStroke(1.dp, TacticalCyanGlow.copy(alpha = 0.5f)),
-                                modifier = Modifier.size(30.dp)
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        imageVector = Icons.Default.Security,
-                                        contentDescription = null,
-                                        tint = TacticalCyanGlow,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column {
-                                Text(
-                                    text = "MCPTT RADIO CONSOLE",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Black,
-                                    color = Color.White,
-                                    fontFamily = FontFamily.Monospace,
-                                    letterSpacing = 0.8.sp
-                                )
-                                Text(
-                                    text = "MISSION CRITICAL VOICE & DATA",
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = TacticalCyanGlow,
-                                    letterSpacing = 1.sp
-                                )
-                            }
-                        }
-
-                        // Callsign Badge
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = TacticalPlateInset,
-                            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "CALLSIGN: ",
-                                    fontSize = 8.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = HighDensityTextSecondary,
-                                    fontFamily = FontFamily.Monospace
-                                )
-                                Text(
-                                    text = profile.displayName.ifBlank { "UNIT-1" }.uppercase(),
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Black,
-                                    color = Color.White,
-                                    fontFamily = FontFamily.Monospace,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // Bottom row: Human-friendly connectivity status
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("apn_network_card"),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            val statusDotColor = when (registrationState) {
-                                RegistrationState.REGISTERED -> HighDensitySecondary
-                                RegistrationState.AUTHENTICATING,
-                                RegistrationState.REGISTERING -> HighDensityWarning
-                                RegistrationState.MCPTT_APN_BOUND -> TacticalCyanGlow
-                                RegistrationState.REGISTRATION_FAILED,
-                                RegistrationState.NETWORK_UNAVAILABLE -> HighDensityEmergency
-                                RegistrationState.UNREGISTERED -> Color(0xFF64748B)
-                            }
-
-                            // Glowing LED
-                            Box(
-                                modifier = Modifier
-                                    .size(9.dp)
-                                    .clip(CircleShape)
-                                    .background(statusDotColor)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column {
-                                val statusLabel = when (registrationState) {
-                                    RegistrationState.REGISTERED -> "CORE CONNECTED • READY"
-                                    RegistrationState.AUTHENTICATING,
-                                    RegistrationState.REGISTERING -> "CONNECTING TO MCPTT CORE..."
-                                    RegistrationState.MCPTT_APN_BOUND -> "APN BOUND • READY TO REGISTER"
-                                    RegistrationState.REGISTRATION_FAILED -> "REGISTRATION FAILED"
-                                    RegistrationState.NETWORK_UNAVAILABLE -> "NETWORK CARRIER OFFLINE"
-                                    RegistrationState.UNREGISTERED -> "OFFLINE • STANDBY"
-                                }
-                                Text(
-                                    text = statusLabel,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = when (registrationState) {
-                                        RegistrationState.REGISTERED -> HighDensitySecondary
-                                        RegistrationState.REGISTRATION_FAILED -> HighDensityEmergency
-                                        RegistrationState.AUTHENTICATING,
-                                        RegistrationState.REGISTERING -> HighDensityWarning
-                                        else -> HighDensityTextPrimary
-                                    },
-                                    fontFamily = FontFamily.Monospace
-                                )
-                                if (registrationState == RegistrationState.REGISTRATION_FAILED && !failureReason.isNullOrBlank()) {
-                                    Text(
-                                        text = failureReason ?: "",
-                                        fontSize = 9.sp,
-                                        color = HighDensityEmergency,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                        }
-
-                        // Action buttons
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (registrationState != RegistrationState.REGISTERED) {
-                                val isConnecting = registrationState == RegistrationState.AUTHENTICATING ||
-                                    registrationState == RegistrationState.REGISTERING
-                                Button(
-                                    onClick = { viewModel.registerSip() },
-                                    enabled = !isConnecting,
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = TacticalCyanGlow,
-                                        disabledContainerColor = TacticalCyanGlow.copy(alpha = 0.5f)
-                                    ),
-                                    shape = RoundedCornerShape(6.dp),
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 3.dp),
-                                    modifier = Modifier
-                                        .height(30.dp)
-                                        .testTag("register_button")
-                                ) {
-                                    Text(
-                                        text = if (isConnecting) "WAIT..." else "CONNECT",
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White
-                                    )
-                                }
-                                Spacer(modifier = Modifier.width(6.dp))
-                            }
-
-                            IconButton(
-                                onClick = { viewModel.refreshNetwork() },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Refresh,
-                                    contentDescription = "Refresh radio network",
-                                    tint = TacticalCyanGlow,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            // ==========================================
-            // 2. ACTIVE TALKGROUP BANNER
-            // ==========================================
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
-                shape = RoundedCornerShape(14.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = TacticalPlateRaised,
-                            border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
-                            modifier = Modifier.size(42.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    imageVector = Icons.Default.Groups,
-                                    contentDescription = "Talkgroup",
-                                    tint = TacticalCyanGlow,
-                                    modifier = Modifier.size(24.dp)
-                                )
-                            }
-                        }
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Column {
-                            Text(
-                                text = "ACTIVE TALKGROUP",
-                                fontSize = 9.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = TacticalCyanGlow,
-                                fontFamily = FontFamily.Monospace,
-                                letterSpacing = 0.5.sp
-                            )
-                            Text(
-                                text = groupFriendlyName,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Black,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = "Primary Tactical Voice Net",
-                                fontSize = 10.sp,
-                                color = HighDensityTextSecondary
-                            )
-                        }
-                    }
-
-                    // Channel active pill
+                // Identity & Callsign
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Surface(
                         shape = RoundedCornerShape(8.dp),
-                        color = if (isDialogConnected) HighDensitySecondary.copy(alpha = 0.2f) else TacticalPlateInset,
-                        border = androidx.compose.foundation.BorderStroke(
-                            1.dp,
-                            if (isDialogConnected) HighDensitySecondary else TacticalHairlineBorder
-                        )
+                        color = TacticalPlateRaised,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, TacticalCyanGlow.copy(alpha = 0.5f)),
+                        modifier = Modifier.size(34.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(6.dp)
-                                    .clip(CircleShape)
-                                    .background(if (isDialogConnected) HighDensitySecondary else Color(0xFF64748B))
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (isDialogConnected) "CALL ACTIVE" else "STANDBY",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = if (isDialogConnected) HighDensitySecondary else HighDensityTextSecondary,
-                                fontFamily = FontFamily.Monospace
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Default.Radio,
+                                contentDescription = "Radio Identity",
+                                tint = TacticalCyanGlow,
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            // ==========================================
-            // 3. TACTICAL FLOOR STATUS BANNER & AUDIO VU
-            // ==========================================
-            val isTransmitting = floorState == FloorState.GRANTED
-            val isReceiving = floorState == FloorState.LISTENING
-
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = when {
-                        floorBusy -> HighDensityEmergency.copy(alpha = 0.15f)
-                        isTransmitting -> HighDensitySecondary.copy(alpha = 0.15f)
-                        floorState == FloorState.REQUESTING -> HighDensityWarning.copy(alpha = 0.15f)
-                        isReceiving -> Color(0xFF0284C7).copy(alpha = 0.15f)
-                        else -> TacticalPlateSurface
-                    }
-                ),
-                border = androidx.compose.foundation.BorderStroke(
-                    1.dp,
-                    when {
-                        floorBusy -> HighDensityEmergency
-                        isTransmitting -> HighDensitySecondary
-                        floorState == FloorState.REQUESTING -> HighDensityWarning
-                        isReceiving -> TacticalCyanGlow
-                        else -> TacticalHairlineBorder
-                    }
-                ),
-                shape = RoundedCornerShape(14.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(12.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        Icon(
-                            imageVector = when {
-                                floorBusy -> Icons.Default.Warning
-                                isTransmitting -> Icons.Default.Mic
-                                floorState == FloorState.REQUESTING -> Icons.Default.CellTower
-                                isReceiving -> Icons.Default.VolumeUp
-                                floorState == FloorState.RELEASING -> Icons.Default.CellTower
-                                isDialogConnected -> Icons.Default.Radio
-                                else -> Icons.Default.PhoneInTalk
-                            },
-                            contentDescription = null,
-                            tint = when {
-                                floorBusy -> HighDensityEmergency
-                                isTransmitting -> HighDensitySecondary
-                                floorState == FloorState.REQUESTING -> HighDensityWarning
-                                isReceiving -> TacticalCyanGlow
-                                else -> Color.White
-                            },
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
                         Text(
-                            text = when {
-                                floorBusy -> "FLOOR BUSY"
-                                isTransmitting -> "YOU HAVE THE FLOOR"
-                                floorState == FloorState.REQUESTING -> "REQUESTING FLOOR..."
-                                isReceiving -> "LISTENING — REMOTE SPEAKER"
-                                floorState == FloorState.RELEASING -> "RELEASING FLOOR..."
-                                isDialogConnected -> "READY TO TALK"
-                                else -> "READY (CONNECT SESSION TO TALK)"
-                            },
+                            text = "MCPTT RADIO",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Black,
-                            color = when {
-                                floorBusy -> HighDensityEmergency
-                                isTransmitting -> HighDensitySecondary
-                                floorState == FloorState.REQUESTING -> HighDensityWarning
-                                isReceiving -> TacticalCyanGlow
-                                else -> Color.White
-                            },
+                            color = Color.White,
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = 0.8.sp
+                        )
+                        Text(
+                            text = profile.displayName.ifBlank { "UNIT-1" }.uppercase(),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TacticalCyanGlow,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+
+                // Simple Connection Status Indicator
+                val statusDotColor = when (registrationState) {
+                    RegistrationState.REGISTERED -> HighDensitySecondary
+                    RegistrationState.AUTHENTICATING,
+                    RegistrationState.REGISTERING,
+                    RegistrationState.MCPTT_APN_BOUND -> HighDensityWarning
+                    RegistrationState.REGISTRATION_FAILED,
+                    RegistrationState.NETWORK_UNAVAILABLE -> HighDensityEmergency
+                    RegistrationState.UNREGISTERED -> Color(0xFF64748B)
+                }
+
+                val statusLabel = when (registrationState) {
+                    RegistrationState.REGISTERED -> "READY"
+                    RegistrationState.AUTHENTICATING,
+                    RegistrationState.REGISTERING -> "CONNECTING"
+                    RegistrationState.MCPTT_APN_BOUND -> "STANDBY"
+                    RegistrationState.REGISTRATION_FAILED -> "ERROR"
+                    RegistrationState.NETWORK_UNAVAILABLE -> "NO CARRIER"
+                    RegistrationState.UNREGISTERED -> "OFFLINE"
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = TacticalPlateInset,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(statusDotColor)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = statusLabel,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = statusDotColor,
                             fontFamily = FontFamily.Monospace,
                             letterSpacing = 0.5.sp
                         )
                     }
+                }
+            }
 
-                    Spacer(modifier = Modifier.height(4.dp))
+            // ==========================================
+            // 2. TALKGROUP SELECTOR (CLEAN DROPDOWN ONLY)
+            // ==========================================
+            Box(contentAlignment = Alignment.Center) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = TacticalPlateRaised.copy(alpha = 0.85f),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
+                    modifier = Modifier.clickable { isGroupDropdownExpanded = true }
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = "ACTIVE TALKGROUP",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TacticalCyanGlow,
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = 1.sp
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Text(
+                                text = groupFriendlyName,
+                                fontSize = 19.sp,
+                                fontWeight = FontWeight.Black,
+                                color = Color.White,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(
+                                imageVector = Icons.Default.ArrowDropDown,
+                                contentDescription = "Select Talkgroup",
+                                tint = TacticalCyanGlow,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
 
-                    Text(
-                        text = when {
-                            isTransmitting -> "Transmitting Microphone Audio • Release PTT to end"
-                            isReceiving -> "${activeSpeaker ?: "Remote Speaker"} is transmitting"
-                            floorBusy -> "Channel occupied • Wait before transmitting"
-                            floorState == FloorState.REQUESTING -> "Floor request dispatched to Server"
-                            isDialogConnected -> "Floor Available • Press and hold PTT to speak"
-                            else -> "Session Standby • Start Call to establish channel"
-                        },
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = HighDensityTextSecondary,
-                        textAlign = TextAlign.Center
-                    )
-
-                    if (isTransmitting || audioLevel > 0.01f || isReceiving) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        TacticalConsoleAudioMeter(audioLevel = if (isReceiving) 0.7f else audioLevel)
+                // Clean Talkgroups Dropdown: ONLY Selectable Talkgroups
+                DropdownMenu(
+                    expanded = isGroupDropdownExpanded,
+                    onDismissRequest = { isGroupDropdownExpanded = false },
+                    modifier = Modifier
+                        .background(TacticalPlateSurface)
+                        .border(1.dp, TacticalHairlineBorder, RoundedCornerShape(8.dp))
+                ) {
+                    viewModel.presetGroups.forEach { group ->
+                        val isSelected = group.first.equals(profile.targetGroup, ignoreCase = true)
+                        DropdownMenuItem(
+                            text = {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = group.second,
+                                        fontSize = 13.sp,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                        color = if (isSelected) TacticalCyanGlow else HighDensityTextPrimary,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                    if (isSelected) {
+                                        Spacer(modifier = Modifier.width(16.dp))
+                                        Icon(
+                                            imageVector = Icons.Default.Check,
+                                            contentDescription = "Selected",
+                                            tint = TacticalCyanGlow,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                            },
+                            onClick = {
+                                viewModel.updateProfile(profile.copy(targetGroup = group.first))
+                                viewModel.subscribeGroup()
+                                isGroupDropdownExpanded = false
+                            }
+                        )
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
-
             // ==========================================
-            // 4. MAIN PTT BUTTON (MISSION CONTROL CENTERPIECE)
+            // 3. CENTER: DOMINANT TACTICAL PTT BUTTON
             // ==========================================
-            val canHoldPtt = isRegistered && floorState != FloorState.LISTENING && !floorBusy
-
             Box(
                 modifier = Modifier.padding(vertical = 4.dp),
                 contentAlignment = Alignment.Center
             ) {
-                // Outer illuminated halo glow when speaking or requesting
-                if (isTransmitting || floorState == FloorState.REQUESTING) {
+                // Outer illuminated halo glow when active
+                if (isTransmitting || floorState == FloorState.REQUESTING || isReceiving) {
                     Box(
                         modifier = Modifier
-                            .size(232.dp)
+                            .size(272.dp)
                             .clip(CircleShape)
                             .background(
                                 Brush.radialGradient(
                                     colors = listOf(
-                                        (if (isTransmitting) HighDensitySecondary else HighDensityWarning).copy(alpha = haloAlpha * 0.4f),
+                                        (when {
+                                            isTransmitting -> HighDensitySecondary
+                                            floorState == FloorState.REQUESTING -> HighDensityWarning
+                                            isReceiving -> Color(0xFF0284C7)
+                                            else -> HighDensitySecondary
+                                        }).copy(alpha = haloAlpha * 0.45f),
                                         Color.Transparent
                                     )
                                 )
@@ -645,31 +413,29 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                     )
                 }
 
-                // Machined tactical handset outer bezel
+                // Machined Handset Outer Bezel
                 Surface(
                     shape = CircleShape,
                     color = TacticalPlateInset,
                     border = androidx.compose.foundation.BorderStroke(3.dp, TacticalHairlineBorder),
-                    modifier = Modifier.size(216.dp),
-                    shadowElevation = 8.dp
+                    modifier = Modifier.size(244.dp),
+                    shadowElevation = 10.dp
                 ) {
                     Box(
                         modifier = Modifier.fillMaxSize(),
                         contentAlignment = Alignment.Center
                     ) {
-                        // Tick mark ring
-                        Canvas(modifier = Modifier.size(204.dp)) {
+                        Canvas(modifier = Modifier.size(232.dp)) {
                             drawCircle(
-                                color = TacticalHairlineBorder.copy(alpha = 0.7f),
+                                color = TacticalHairlineBorder.copy(alpha = 0.8f),
                                 radius = size.minDimension / 2f - 2f,
                                 style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5f)
                             )
                         }
 
-                        // Middle recessed groove
                         Box(
                             modifier = Modifier
-                                .size(196.dp)
+                                .size(220.dp)
                                 .clip(CircleShape)
                                 .border(2.dp, TacticalPlateRaised, CircleShape)
                         )
@@ -679,7 +445,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 // Interactive PTT Dome with press feedback
                 Box(
                     modifier = Modifier
-                        .size(188.dp)
+                        .size(208.dp)
                         .scale(if (isPttHeld && isTransmitting) pulseScale else 1f)
                         .clip(CircleShape)
                         .background(
@@ -687,7 +453,7 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                                 colors = listOf(
                                     pttColor.copy(alpha = 0.95f),
                                     pttColor,
-                                    Color.Black.copy(alpha = 0.35f)
+                                    Color.Black.copy(alpha = 0.4f)
                                 )
                             )
                         )
@@ -729,10 +495,10 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                             },
                             contentDescription = "Push To Talk Button",
                             tint = Color.White,
-                            modifier = Modifier.size(50.dp)
+                            modifier = Modifier.size(56.dp)
                         )
 
-                        Spacer(modifier = Modifier.height(4.dp))
+                        Spacer(modifier = Modifier.height(6.dp))
 
                         Text(
                             text = when {
@@ -744,24 +510,24 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                                 floorState == FloorState.RELEASING -> "RELEASING"
                                 else -> "PUSH TO TALK"
                             },
-                            fontSize = 14.sp,
+                            fontSize = 16.sp,
                             fontWeight = FontWeight.Black,
                             color = Color.White,
                             fontFamily = FontFamily.Monospace,
-                            letterSpacing = 0.6.sp
+                            letterSpacing = 0.8.sp
                         )
 
-                        Spacer(modifier = Modifier.height(2.dp))
+                        Spacer(modifier = Modifier.height(3.dp))
 
                         Text(
                             text = when {
                                 isTransmitting -> "AUDIO LIVE"
-                                isReceiving -> "RECEIVING"
-                                floorBusy -> "WAIT FOR FLOOR"
-                                !isRegistered -> "CONNECT FIRST"
-                                else -> "HOLD TO SPEAK"
+                                isReceiving -> "RECEIVING AUDIO"
+                                floorBusy -> "CHANNEL OCCUPIED"
+                                !isRegistered -> "OFFLINE"
+                                else -> "HOLD TO TALK"
                             },
-                            fontSize = 9.sp,
+                            fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color.White.copy(alpha = 0.85f),
                             letterSpacing = 1.sp
@@ -770,333 +536,149 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            // ==========================================
+            // 4. BELOW BUTTON: SIMPLE DYNAMIC STATUS
+            // ==========================================
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                val statusMessage = when {
+                    floorBusy -> "FLOOR BUSY"
+                    isTransmitting -> "YOU HAVE THE FLOOR"
+                    isReceiving -> "${activeSpeaker ?: "REMOTE OPERATOR"} IS SPEAKING"
+                    floorState == FloorState.REQUESTING -> "REQUESTING FLOOR..."
+                    floorState == FloorState.RELEASING -> "RELEASING FLOOR..."
+                    isDialogConnected -> "READY TO TALK"
+                    isRegistered -> "READY TO TALK"
+                    registrationState == RegistrationState.REGISTERING ||
+                        registrationState == RegistrationState.AUTHENTICATING -> "CONNECTING TO MCPTT CORE..."
+                    else -> "NOT CONNECTED"
+                }
+
+                val statusMessageColor = when {
+                    floorBusy -> HighDensityEmergency
+                    isTransmitting -> HighDensitySecondary
+                    floorState == FloorState.REQUESTING -> HighDensityWarning
+                    isReceiving -> TacticalCyanGlow
+                    isDialogConnected || isRegistered -> Color.White
+                    else -> HighDensityTextSecondary
+                }
+
+                Text(
+                    text = statusMessage,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Black,
+                    color = statusMessageColor,
+                    fontFamily = FontFamily.Monospace,
+                    letterSpacing = 0.6.sp,
+                    textAlign = TextAlign.Center
+                )
+
+                if (isTransmitting || audioLevel > 0.01f || isReceiving) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TacticalConsoleAudioMeter(audioLevel = if (isReceiving) 0.7f else audioLevel)
+                }
+            }
 
             // ==========================================
-            // 5. SESSION & VOICE CONTROLS (UNCLIPPED 2-COLUMN + SYNC)
+            // 5. COMPACT ICON-BASED CONTROLS (SESSION & FLOOR)
             // ==========================================
-            val isFloorButtonEnabled = isRegistered &&
-                isDialogConnected &&
-                !floorBusy &&
+            val isFloorActionEnabled = isRegistered && isDialogConnected && !floorBusy &&
                 (floorState == FloorState.IDLE || floorState == FloorState.GRANTED)
 
-            // Row 1: The two primary controls side-by-side with 52.dp height and ample horizontal padding
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                // Control 1: Call Session (START SESSION / END SESSION)
-                if (isDialogConnected) {
-                    Button(
-                        onClick = { viewModel.endCallSession() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = HighDensityEmergency,
-                            contentColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(52.dp)
-                            .testTag("end_call_button")
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.CallEnd,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp),
-                                tint = Color.White
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "END SESSION",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-                } else {
-                    Button(
-                        onClick = { viewModel.startCall() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = TacticalCyanGlow,
-                            contentColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(52.dp)
-                            .testTag("initiate_call_button")
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.PhoneInTalk,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp),
-                                tint = Color.White
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "START SESSION",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-                }
-
-                // Control 2: Floor Toggle (REQUEST FLOOR / RELEASE FLOOR)
-                Button(
-                    onClick = {
-                        if (floorState == FloorState.GRANTED) {
-                            viewModel.releaseFloor()
-                        } else if (floorState == FloorState.IDLE) {
-                            viewModel.requestFloor()
-                        }
-                    },
-                    enabled = isFloorButtonEnabled,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = when {
-                            floorState == FloorState.GRANTED -> HighDensitySecondary
-                            else -> TacticalPlateRaised
-                        },
-                        disabledContainerColor = TacticalPlateInset,
-                        contentColor = if (floorState == FloorState.GRANTED) Color.White else TacticalCyanGlow,
-                        disabledContentColor = HighDensityTextSecondary
-                    ),
-                    border = androidx.compose.foundation.BorderStroke(
-                        1.dp,
-                        if (floorState == FloorState.GRANTED) HighDensitySecondary else TacticalHairlineBorder
-                    ),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(52.dp)
-                        .testTag("request_floor_button")
-                ) {
-                    Text(
-                        text = when {
-                            floorState == FloorState.GRANTED -> "RELEASE FLOOR"
-                            floorBusy -> "FLOOR BUSY"
-                            else -> "REQUEST FLOOR"
-                        },
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Row 2: Talkgroup Sync / Subscribe button (testTag subscribe_button)
-            Button(
-                onClick = { viewModel.subscribeGroup() },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = TacticalPlateRaised,
-                    contentColor = TacticalCyanGlow
-                ),
-                border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
-                shape = RoundedCornerShape(10.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(44.dp)
-                    .testTag("subscribe_button")
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Default.RssFeed,
-                    contentDescription = null,
-                    tint = TacticalCyanGlow,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "SYNC TALKGROUP SUBSCRIPTION",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace,
-                    letterSpacing = 0.5.sp
-                )
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // ==========================================
-            // 6. FUNCTIONAL TACTICAL MESSAGING (SDS CONVERSATION CONSOLE)
-            // ==========================================
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = TacticalPlateSurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
-                shape = RoundedCornerShape(14.dp)
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    // Header Bar with Toggle
+                // Control 1: Session Control (Phone/Session symbol)
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (isDialogConnected) HighDensityEmergency.copy(alpha = 0.18f) else TacticalPlateRaised,
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.5.dp,
+                        if (isDialogConnected) HighDensityEmergency else TacticalHairlineBorder
+                    ),
+                    modifier = Modifier
+                        .clickable {
+                            if (isDialogConnected) viewModel.endCallSession() else viewModel.startCall()
+                        }
+                        .testTag(if (isDialogConnected) "end_call_button" else "initiate_call_button")
+                ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Surface(
-                                shape = CircleShape,
-                                color = TacticalCyanGlow.copy(alpha = 0.2f),
-                                modifier = Modifier.size(26.dp)
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        imageVector = Icons.Default.Chat,
-                                        contentDescription = "Tactical Messaging",
-                                        tint = TacticalCyanGlow,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                }
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column {
-                                Text(
-                                    text = "TACTICAL MESSAGING (SDS)",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Black,
-                                    color = TacticalCyanGlow,
-                                    letterSpacing = 0.5.sp
-                                )
-                                Text(
-                                    text = "Short Data Service • 1:1 & Group Broadcast",
-                                    fontSize = 9.sp,
-                                    color = HighDensityTextSecondary
-                                )
-                            }
-                        }
-
-                        IconButton(
-                            onClick = { isMessagingExpanded = !isMessagingExpanded },
-                            modifier = Modifier.size(30.dp)
-                        ) {
-                            Icon(
-                                imageVector = if (isMessagingExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                                contentDescription = "Toggle Tactical Messaging console",
-                                tint = TacticalCyanGlow
-                            )
-                        }
+                        Icon(
+                            imageVector = if (isDialogConnected) Icons.Default.CallEnd else Icons.Default.PhoneInTalk,
+                            contentDescription = if (isDialogConnected) "End Session" else "Start Session",
+                            tint = if (isDialogConnected) HighDensityEmergency else TacticalCyanGlow,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (isDialogConnected) "END SESSION" else "START SESSION",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isDialogConnected) HighDensityEmergency else Color.White,
+                            fontFamily = FontFamily.Monospace
+                        )
                     }
+                }
 
-                    // Full Conversation Console when expanded
-                    AnimatedVisibility(
-                        visible = isMessagingExpanded,
-                        enter = fadeIn() + expandVertically(),
-                        exit = fadeOut() + shrinkVertically()
+                Spacer(modifier = Modifier.width(16.dp))
+
+                // Control 2: Floor Request Control (Raised Hand symbol)
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (floorState == FloorState.GRANTED) HighDensitySecondary.copy(alpha = 0.22f) else TacticalPlateRaised,
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.5.dp,
+                        if (floorState == FloorState.GRANTED) HighDensitySecondary else TacticalHairlineBorder
+                    ),
+                    modifier = Modifier
+                        .clickable(enabled = isFloorActionEnabled) {
+                            if (floorState == FloorState.GRANTED) {
+                                viewModel.releaseFloor()
+                            } else if (floorState == FloorState.IDLE) {
+                                viewModel.requestFloor()
+                            }
+                        }
+                        .testTag("request_floor_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.padding(top = 10.dp)) {
-                            TacticalMessagingView(viewModel = viewModel, isCompact = true)
-                        }
-                    }
-
-                    // Always-visible Quick Input row (Guarantees quick_msg_input & send_msg_button test tags exist in tree)
-                    if (!isMessagingExpanded) {
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            OutlinedTextField(
-                                value = quickMsgText,
-                                onValueChange = { quickMsgText = it },
-                                placeholder = {
-                                    Text(
-                                        "Broadcast message to ${groupFriendlyName}...",
-                                        fontSize = 11.sp,
-                                        color = HighDensityTextSecondary
-                                    )
-                                },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .testTag("quick_msg_input"),
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedContainerColor = TacticalPlateRaised,
-                                    unfocusedContainerColor = TacticalPlateRaised,
-                                    focusedBorderColor = TacticalCyanGlow,
-                                    unfocusedBorderColor = TacticalHairlineBorder,
-                                    focusedTextColor = HighDensityTextPrimary,
-                                    unfocusedTextColor = HighDensityTextPrimary
-                                ),
-                                shape = RoundedCornerShape(10.dp),
-                                singleLine = true
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            IconButton(
-                                onClick = {
-                                    if (quickMsgText.isNotBlank()) {
-                                        viewModel.sendTextMessage(profile.targetGroup, quickMsgText)
-                                        quickMsgText = ""
-                                    }
-                                },
-                                modifier = Modifier
-                                    .background(TacticalCyanGlow, RoundedCornerShape(10.dp))
-                                    .size(46.dp)
-                                    .testTag("send_msg_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Send,
-                                    contentDescription = "Send Message",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            }
-                        }
+                        Icon(
+                            imageVector = Icons.Default.FrontHand,
+                            contentDescription = if (floorState == FloorState.GRANTED) "Release Floor" else "Request Floor",
+                            tint = when {
+                                floorState == FloorState.GRANTED -> HighDensitySecondary
+                                !isFloorActionEnabled -> HighDensityTextSecondary.copy(alpha = 0.4f)
+                                else -> TacticalCyanGlow
+                            },
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = when {
+                                floorState == FloorState.GRANTED -> "RELEASE"
+                                floorBusy -> "OCCUPIED"
+                                else -> "REQUEST"
+                            },
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = when {
+                                floorState == FloorState.GRANTED -> HighDensitySecondary
+                                !isFloorActionEnabled -> HighDensityTextSecondary.copy(alpha = 0.4f)
+                                else -> Color.White
+                            },
+                            fontFamily = FontFamily.Monospace
+                        )
                     }
                 }
             }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // ==========================================
-            // 7. EMERGENCY SOS BROADCAST ACTION
-            // ==========================================
-            Button(
-                onClick = { viewModel.triggerEmergencyAlert("EMERGENCY SOS ALERT") },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = HighDensityEmergency,
-                    contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp)
-                    .testTag("emergency_sos_button")
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Warning,
-                    contentDescription = "Emergency Alert",
-                    tint = Color.White,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                    text = "EMERGENCY BROADCAST (SOS)",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Black,
-                    fontFamily = FontFamily.Monospace,
-                    letterSpacing = 0.8.sp
-                )
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
         }
     }
 }
@@ -1108,11 +690,11 @@ fun TacticalPttScreen(viewModel: McpttViewModel) {
 fun TacticalConsoleAudioMeter(audioLevel: Float) {
     Canvas(
         modifier = Modifier
-            .fillMaxWidth()
-            .height(10.dp)
-            .clip(RoundedCornerShape(5.dp))
+            .fillMaxWidth(0.7f)
+            .height(5.dp)
+            .clip(RoundedCornerShape(3.dp))
             .background(TacticalPlateInset)
-            .border(1.dp, TacticalHairlineBorder, RoundedCornerShape(5.dp))
+            .border(1.dp, TacticalHairlineBorder, RoundedCornerShape(3.dp))
     ) {
         val activeWidth = size.width * audioLevel.coerceIn(0.05f, 1f)
         val gradient = Brush.linearGradient(

@@ -6,6 +6,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -82,11 +83,24 @@ import com.example.ui.theme.TacticalPlateInset
 import com.example.ui.theme.TacticalPlateRaised
 import com.example.ui.theme.TacticalPlateSurface
 
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Router
+import com.example.sip.engine.RegistrationState
+
 @Composable
-fun SettingsScreen(viewModel: McpttViewModel) {
+fun SettingsScreen(
+    viewModel: McpttViewModel,
+    onNavigateToTab: (Int) -> Unit = {}
+) {
     val context = LocalContext.current
     val currentProfile by viewModel.sipProfile.collectAsState()
     val netStatus by viewModel.apnNetworkStatus.collectAsState()
+    val registrationState by viewModel.registrationState.collectAsState()
+    val selectedPcscf by viewModel.selectedPcscf.collectAsState()
+    val rtpTxCount by viewModel.rtpTxCount.collectAsState()
+    val rtpRxCount by viewModel.rtpRxCount.collectAsState()
+    val boundRtpPort by viewModel.boundRtpPort.collectAsState()
     val presets by viewModel.presetManager.presets.collectAsState()
     val selectedPresetId by viewModel.presetManager.selectedPresetId.collectAsState()
 
@@ -405,32 +419,55 @@ fun SettingsScreen(viewModel: McpttViewModel) {
             border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
             shape = RoundedCornerShape(14.dp)
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Default.CellTower,
-                        contentDescription = null,
-                        tint = when (netStatus) {
-                            is ApnNetworkStatus.Bound -> HighDensitySecondary
-                            is ApnNetworkStatus.NoMcpttPdn -> HighDensityWarning
-                            else -> TacticalCyanGlow
-                        },
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "CELLULAR BEARER STATUS",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = TacticalCyanGlow,
-                        fontFamily = FontFamily.Monospace
-                    )
+            Column(modifier = Modifier.padding(14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.CellTower,
+                            contentDescription = null,
+                            tint = when (netStatus) {
+                                is ApnNetworkStatus.Bound -> HighDensitySecondary
+                                is ApnNetworkStatus.NoMcpttPdn -> HighDensityWarning
+                                else -> TacticalCyanGlow
+                            },
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "CORE TELEMETRY & APN BEARER",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TacticalCyanGlow,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    IconButton(
+                        onClick = { viewModel.refreshNetwork() },
+                        modifier = Modifier.size(26.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "Refresh Network",
+                            tint = TacticalCyanGlow,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
-                Spacer(modifier = Modifier.height(6.dp))
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Cellular APN Summary
                 Surface(
                     shape = RoundedCornerShape(8.dp),
                     color = TacticalPlateInset,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("apn_network_card")
                 ) {
                     Text(
                         text = netStatus.displaySummary(),
@@ -443,6 +480,125 @@ fun SettingsScreen(viewModel: McpttViewModel) {
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(8.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Diagnostic Telemetry Badges
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Registration & P-CSCF
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = TacticalPlateInset,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("ims_status_card")
+                    ) {
+                        Column(modifier = Modifier.padding(8.dp)) {
+                            Text(
+                                text = "CORE SIP STATE",
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = HighDensityTextSecondary,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = registrationState.name,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (registrationState == RegistrationState.REGISTERED) HighDensitySecondary else HighDensityWarning,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            selectedPcscf?.let { pcscf ->
+                                Text(
+                                    text = "P-CSCF: ${pcscf.host}:${pcscf.port}",
+                                    fontSize = 9.sp,
+                                    color = HighDensityTextSecondary,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                    }
+
+                    // RTP Packet Counters
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = TacticalPlateInset,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Column(modifier = Modifier.padding(8.dp)) {
+                            Text(
+                                text = "RTP MEDIA PACKETS",
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = HighDensityTextSecondary,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = "TX: $rtpTxCount | RX: $rtpRxCount",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = TacticalCyanGlow,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = "Socket Port: $boundRtpPort",
+                                fontSize = 9.sp,
+                                color = HighDensityTextSecondary,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
+
+                if (registrationState != RegistrationState.REGISTERED) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = { viewModel.registerSip() },
+                        colors = ButtonDefaults.buttonColors(containerColor = TacticalCyanGlow),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(36.dp)
+                            .testTag("register_button")
+                    ) {
+                        Text(
+                            text = "CONNECT / REGISTER SIP",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Shortcut button to open SIP Inspector
+                Button(
+                    onClick = { onNavigateToTab(4) },
+                    colors = ButtonDefaults.buttonColors(containerColor = TacticalPlateRaised),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, TacticalHairlineBorder),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    modifier = Modifier.fillMaxWidth().height(38.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Code,
+                        contentDescription = null,
+                        tint = TacticalCyanGlow,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "VIEW FULL PROTOCOL LOGS IN SIP INSPECTOR",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = TacticalCyanGlow,
+                        fontFamily = FontFamily.Monospace
                     )
                 }
             }
